@@ -133,6 +133,272 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                 logger.warning(f"missing 'to' junctions:{missing_t}")
 
 
+
+    # check with increased pipe diameter
+    net5 = net.deepcopy()
+    small_pipes = net5.pipe.inner_diameter_mm < 100
+
+    if small_pipes.any():
+        logger.info("Testing with increased pipe diameters.")
+        net5.pipe.loc[small_pipes, "inner_diameter_mm"] *= 2
+
+        try:
+            pp.pipeflow(net5)
+            if net5.converged:
+                logger.info(
+                    "If pipe diameters below 100 mm were doubled, "
+                    "the pipeflow would converge.")
+
+        except Exception as e:
+            logger.info(
+                "Pipeflow does not converge even if pipe diameters below 100 mm "
+                "are doubled.\n"
+                f"\t\tThe error message is: {e}")
+
+
+
+    # check heat transfer coefficient
+    if any(net.pipe.u_w_per_m2k > 1):
+        logger.warning(
+            f"Some pipes have a heat transfer coefficient u_w_per_m2k > 1 W/(m²K). "
+            f"The highest value in the net is {net.pipe.u_w_per_m2k.max()}. "
+            f"This could lead to strong heat losses or convergence issues."
+        )
+        net6 = net.deepcopy()
+        net6.pipe.loc[net6.pipe.u_w_per_m2k > 1, "u_w_per_m2k"] *= 0.1
+
+        try:
+            pp.pipeflow(net6)
+            if net6.converged:
+                logger.info(
+                    "If pipe heat transfer coefficients above 1 W/(m²K) were reduced "
+                    "by factor 0.1, the pipeflow would converge.")
+        except Exception as e:
+            logger.info(
+                "Pipeflow does not converge even if pipe heat transfer coefficients "
+                "above 1 W/(m²K) are reduced by factor 0.1.\n"
+                f"\t\tThe error message is: {e}")
+
+
+
+    # check with all valves opened
+    if not net.valve.empty and (~net.valve.opened).any():
+        logger.info("Testing with all valves opened.")
+        net7 = net.deepcopy()
+        net7.valve.opened = True
+
+        try:
+            pp.pipeflow(net7)
+            if net7.converged:
+                logger.info(
+                    "If all valves were opened, the pipeflow would converge."
+                )
+        except Exception  as e:
+            logger.info(
+                "Pipeflow does not converge even if all valves are opened.\n"
+                f"\t\tThe error message is: {e}"
+            )
+
+
+    # check heat consumer control parameters
+    # The idea is to reduce the thermal load of the heat consumers.
+    # Lower heat demand (qext_w) and mass flow (controlled_mdot_kg_per_s)
+    # reduce the hydraulic and thermal stress on the network.
+    # For configurations using deltat_k, the temperature difference is
+    # increased to reduce the required mass flow according to
+    # Q = m * cp * deltaT.
+    if hasattr(net, "heat_consumer") and not net.heat_consumer.empty:
+        logger.info("Testing with adjusted heat consumer control parameters.")
+        net8 = net.deepcopy()
+
+        heat_consumer_scaling_factor = 0.1
+        deltat_scaling_factor = 2
+
+        # combination 1: qext_w + controlled_mdot_kg_per_s
+        # reduce heat demand and mass flow
+        mask_qext_mdot = (
+                net8.heat_consumer.qext_w.notna()
+                & net8.heat_consumer.controlled_mdot_kg_per_s.notna()
+                & net8.heat_consumer.deltat_k.isna()
+                & net8.heat_consumer.treturn_k.isna()
+        )
+
+        net8.heat_consumer.loc[mask_qext_mdot, "qext_w"] *= heat_consumer_scaling_factor
+        net8.heat_consumer.loc[mask_qext_mdot, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
+
+        # combination 2: qext_w + deltat_k
+        # reduce heat demand and increase deltaT
+        mask_qext_deltat = (
+                net8.heat_consumer.qext_w.notna()
+                & net8.heat_consumer.controlled_mdot_kg_per_s.isna()
+                & net8.heat_consumer.deltat_k.notna()
+                & net8.heat_consumer.treturn_k.isna()
+        )
+
+        net8.heat_consumer.loc[mask_qext_deltat, "qext_w"] *= heat_consumer_scaling_factor
+
+        net8.heat_consumer.loc[mask_qext_deltat, "deltat_k"] *= deltat_scaling_factor
+
+        # combination 3: qext_w + treturn_k
+        # reduce heat demand
+        mask_qext_treturn = (
+                net8.heat_consumer.qext_w.notna()
+                & net8.heat_consumer.controlled_mdot_kg_per_s.isna()
+                & net8.heat_consumer.deltat_k.isna()
+                & net8.heat_consumer.treturn_k.notna()
+        )
+
+        net8.heat_consumer.loc[ mask_qext_treturn, "qext_w"] *= heat_consumer_scaling_factor
+
+        # combination 4: controlled_mdot_kg_per_s + deltat_k
+        # reduce mass flow and increase deltaT
+        mask_mdot_deltat = (
+                net8.heat_consumer.qext_w.isna()
+                & net8.heat_consumer.controlled_mdot_kg_per_s.notna()
+                & net8.heat_consumer.deltat_k.notna()
+                & net8.heat_consumer.treturn_k.isna()
+        )
+
+        net8.heat_consumer.loc[ mask_mdot_deltat, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
+        net8.heat_consumer.loc[mask_mdot_deltat, "deltat_k"] *= deltat_scaling_factor
+
+        # combination 5: controlled_mdot_kg_per_s + treturn_k
+        # reduce mass flow
+        mask_mdot_treturn = (
+                net8.heat_consumer.qext_w.isna()
+                & net8.heat_consumer.controlled_mdot_kg_per_s.notna()
+                & net8.heat_consumer.deltat_k.isna()
+                & net8.heat_consumer.treturn_k.notna()
+        )
+
+        net8.heat_consumer.loc[mask_mdot_treturn, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
+
+        try:
+            pp.pipeflow(net8)
+            if net8.converged:
+                logger.info("If heat consumer control parameters were adjusted, "
+                    "the pipeflow would converge.")
+
+        except Exception as e:
+            logger.info("Pipeflow does not converge even if heat consumer control "
+                f"parameters are adjusted.\n\t\tThe error message is: {e}")
+
+
+    # check with flattened junction heights
+    if net.junction.height_m.nunique() > 1:
+        logger.info("Testing with flattened junction heights.")
+        net9 = net.deepcopy()
+
+        net9.junction.height_m = 0
+
+        try:
+            pp.pipeflow(net9)
+            if net9.converged:
+                logger.info(
+                    "If all junction heights were set to 0 m, "
+                    "the pipeflow would converge.")
+
+        except Exception as e:
+            logger.info(
+                "Pipeflow does not converge even if all junction heights "
+                "are set to 0 m.\n"
+                f"\t\tThe error message is: {e}"
+            )
+
+
+    # check convergence in different calculation modes
+    # Note: Heat mode cannot be executed independently because it requires
+    # hydraulic results (node pressures and branch mass flows) as input.
+    # Therefore, a hydraulic calculation is performed first and the resulting
+    # PINIT and MDOTINIT values are passed to the heat calculation via sol_vec.
+    logger.info("Testing convergence in different calculation modes.")
+
+    for mode in ["hydraulics", "heat", "sequential", "bidirectional"]:
+        net11 = net.deepcopy()
+
+        try:
+            if mode == "heat":
+                pp.pipeflow(net11, mode="hydraulics")
+
+                sol_vec = np.r_[
+                    net11["_pit"]["node"][:, PINIT],
+                    net11["_pit"]["branch"][:, MDOTINIT]
+                ]
+                pp.pipeflow(net11, mode="heat", sol_vec=sol_vec)
+            else:
+                pp.pipeflow(net11, mode=mode)
+
+            if net11.converged:
+                logger.info(f"The pipeflow converges in mode '{mode}'.")
+
+        except Exception as e:
+            logger.info(
+                f"Pipeflow does not converge in mode '{mode}'.\n"
+                f"\t\tThe error message is: {e}")
+
+
+    # check with changed friction model
+    logger.info("Testing with changed friction models.")
+
+    for friction_model in ["nikuradse", "colebrook", "swamee-jain"]:
+        net12 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net12, friction_model=friction_model)
+            if net.converged:
+                logger.info(
+                    f"The pipeflow converges with friction model '{friction_model}'.")
+
+        except Exception as e:
+            logger.info(
+                f"Pipeflow does not converge with friction model '{friction_model}'.\n"
+                f"\t\tThe error message is: {e}")
+
+
+
+    # check convergence without compressor pressure lift
+    if hasattr(net, "compressor") and not net.compressor.empty:
+        logger.info("Testing without compressor pressure lift.")
+
+        net13 = net.deepcopy()
+        net13.compressor.pressure_ratio = 1
+
+        try:
+            pp.pipeflow(net13)
+            if net.converged:
+                logger.info(
+                    "If compressor pressure ratios were set to 1, "
+                    "the pipeflow would converge.")
+
+        except Exception  as e:
+            logger.info(
+                "Pipeflow does not converge even if compressor pressure ratios "
+                "are set to 1.\n"
+                f"\t\tThe error message is: {e}")
+
+    # check with inactive pressure controls
+    if hasattr(net, "press_control") and not net.press_control.empty:
+        logger.info("Testing with inactive pressure controls.")
+
+        net14 = net.deepcopy()
+        net14.press_control.control_active = False
+
+        try:
+            pp.pipeflow(net14)
+            if net14.converged:
+                logger.info(
+                    "If all pressure controls were deactivated, "
+                    "the pipeflow would converge."
+                )
+
+        except Exception  as e:
+            logger.info(
+                "Pipeflow does not converge even if all pressure controls "
+                f"are deactivated.\n\t\tThe error message is: {e}"
+            )
+
+
+
 def pipeflow_alpha_sweep(net, **kwargs):
     """Run the pipeflow many times with different alpha (NR damping factor) settings between 0.1 and 1 in steps of 0.1"""
     net.converged = False
