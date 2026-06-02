@@ -6,6 +6,8 @@ import pandapipes as pp
 import numpy as np
 
 from pandapipes import PipeflowNotConverged
+from pandapipes.idx_node import PINIT
+from pandapipes.idx_branch import MDOTINIT
 
 try:
     import pandaplan.core.pplog as logging
@@ -15,10 +17,21 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
+def check_net(net, low_length_limit_km=0.01,
+              check_scaling_factor=1e-5,
+              diameter_increase_factor=2,
+              heat_consumer_scaling_factor=0.1,
+              deltat_scaling_factor=2):
     """
-    Run some diagnostic checks on the net to identify potential flaws.
+
+    Run diagnostic checks on the net to identify potential flaws.
+
+    The checks apply selected modifications to copies of the input net and
+    test whether pipeflow convergence improves. A PipeflowNotConverged
+    exception is treated as a diagnostic result, while other exceptions
+    indicate that the corresponding check could not be evaluated
     """
+
     net = net.deepcopy()  # do not modify the direct input
     try:
         pp.pipeflow(net)
@@ -47,20 +60,25 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                        f"{ll.length_km.min()} km.\n"
                        f"(IDs of pipelines with low length: {ll.index})")
 
-    net2 = net.deepcopy()
-    net2.pipe.loc[net2.pipe.length_km < low_length_limit_km].length_km = low_length_limit_km
-    try:
-        pp.pipeflow(net2)
-        if net2.converged:
-            logger.info(f"If all short pipelines (< {low_length_limit_km} km) were set to "
-                        f"{low_length_limit_km} km, the pipeflow would converge.")
-        else:
-            logger.warning(f"If all short pipelines (< {low_length_limit_km} km) were set to "
-                        f"{low_length_limit_km} km, the pipeflow would still NOT converge.")
-    except Exception as e:
-        logger.info(f"Pipeflow does not converge, even if all short pipelines (< 10 m) were set "
-                    f"to {low_length_limit_km} km. \n"
-                    f"\t\tThe error message is: {e}")
+        net2 = net.deepcopy()
+        net2.pipe.loc[net2.pipe.length_km < low_length_limit_km].length_km = low_length_limit_km
+        try:
+            pp.pipeflow(net2)
+            if net2.converged:
+                logger.info(
+                    f"If all short pipelines (< {low_length_limit_km} km) were set to "
+                    f"{low_length_limit_km} km, the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
+            logger.info(
+                f"Pipeflow still does not converge if all short pipelines "
+                f"(< {low_length_limit_km} km) are set to {low_length_limit_km} km."
+            )
+        except Exception as e:
+            logger.warning(
+                "The short-pipeline-length check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check iterations
     iterations = 200
@@ -72,24 +90,32 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
         logger.info(f"After {iterations:d} iterations the pipeflow did NOT converge.")
 
     # check with little sink and source scaling
-    logger.info("Testing with scaled-down sinks and sources.")
-    net3 = net.deepcopy()
-    if hasattr(net, "sink"):
-        net3.sink.scaling *= check_scaling_factor
-    if hasattr(net, "source"):
-        net3.source.scaling *= check_scaling_factor
-    try:
-        pp.pipeflow(net3)
-        if net3.converged:
-            logger.info(f"If sinks and sources were scaled with a factor of to "
-                        f"{check_scaling_factor}, the pipeflow would converge.")
-        else:
-            logger.warning(f"If sinks and sources were scaled with a factor of to "
-                           f"{check_scaling_factor}, the pipeflow would still NOT converge.")
-    except Exception as e:
-        logger.info(f"Pipeflow does not converge with sinks/sources scaled by"
-                    f" {check_scaling_factor}.\n"
-                    f"\t\tThe error message is: {e}")
+    if hasattr(net, "sink") or hasattr(net, "source"):
+        logger.info("Testing with scaled-down sinks and sources.")
+
+        net3 = net.deepcopy()
+
+        if hasattr(net3, "sink"):
+            net3.sink.scaling *= check_scaling_factor
+        if hasattr(net3, "source"):
+            net3.source.scaling *= check_scaling_factor
+        try:
+            pp.pipeflow(net3)
+            if net3.converged:
+                logger.info(
+                    f"If sinks and sources were scaled by a factor of "
+                    f"{check_scaling_factor}, the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
+            logger.info(
+                f"Pipeflow still does not converge if sinks and sources are "
+                f"scaled by a factor of {check_scaling_factor}."
+            )
+        except Exception as e:
+            logger.warning(
+                "The sink/source scaling check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check k
     if any(net.pipe.k_mm > 0.5):
@@ -99,17 +125,24 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                        f"\nRough pipes: {net.pipe.loc[net.pipe.k_mm > 0.5]}.")
     net4 = net.deepcopy()
     net4.pipe.k_mm = 1e-5
+
     try:
         pp.pipeflow(net4)
         if net4.converged:
-            logger.info(f"If the friction factor would be reduced to 1e-5 for all pipes, "
-                        f"the pipeflow would converge.")
-        else:
-            logger.warning(f"If the friction factor would be reduced to 1e-5 for all pipes, "
-                           f"the pipeflow would still NOT converge.")
+            logger.info(
+                "If the friction factor were reduced to 1e-5 for all pipes, "
+                "the pipeflow would converge."
+            )
+    except PipeflowNotConverged:
+        logger.info(
+            "Pipeflow still does not converge if k_mm is reduced to 1e-5 "
+            "for all pipes."
+        )
     except Exception as e:
-        logger.info(f"Pipeflow does not converge with k_mm = 1-e5 for all pipes.\n"
-                    f"\t\tThe error message is: {e}")
+        logger.warning(
+            "The pipe-roughness check failed.\n"
+            f"\t\tThe error message is: {e}"
+        )
 
     # check sink and source junctions:
     node_component = ["sink", "source", "ext_grid"]
@@ -132,38 +165,45 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                 logger.warning(f"missing 'from' junctions:{missing_f}")
                 logger.warning(f"missing 'to' junctions:{missing_t}")
 
-
-
     # check with increased pipe diameter
     net5 = net.deepcopy()
-    small_pipes = net5.pipe.inner_diameter_mm < 100
 
+    if net5.fluid.is_gas:
+        diameter_threshold_mm = 6
+    else:
+        diameter_threshold_mm = 20
+
+    small_pipes = net5.pipe.inner_diameter_mm < diameter_threshold_mm
     if small_pipes.any():
-        logger.info("Testing with increased pipe diameters.")
-        net5.pipe.loc[small_pipes, "inner_diameter_mm"] *= 2
+        logger.info(
+            f"Testing with pipe diameters below {diameter_threshold_mm} mm "
+            f"increased by factor {diameter_increase_factor}."
+        )
+        net5.pipe.loc[small_pipes, "inner_diameter_mm"] *= diameter_increase_factor
 
         try:
             pp.pipeflow(net5)
             if net5.converged:
                 logger.info(
-                    "If pipe diameters below 100 mm were doubled, "
-                    "the pipeflow would converge.")
+                    f"If pipe diameters below {diameter_threshold_mm} mm were increased "
+                    f"by factor {diameter_increase_factor}, the pipeflow would converge."
+                )
+
+        except PipeflowNotConverged:
+            logger.info(
+                f"Pipeflow still does not converge if pipe diameters below "
+                f"{diameter_threshold_mm} mm are increased by factor "
+                f"{diameter_increase_factor}."
+            )
 
         except Exception as e:
-            logger.info(
-                "Pipeflow does not converge even if pipe diameters below 100 mm "
-                "are doubled.\n"
-                f"\t\tThe error message is: {e}")
-
-
+            logger.warning(
+                "The pipe-diameter check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check heat transfer coefficient
     if any(net.pipe.u_w_per_m2k > 1):
-        logger.warning(
-            f"Some pipes have a heat transfer coefficient u_w_per_m2k > 1 W/(m²K). "
-            f"The highest value in the net is {net.pipe.u_w_per_m2k.max()}. "
-            f"This could lead to strong heat losses or convergence issues."
-        )
         net6 = net.deepcopy()
         net6.pipe.loc[net6.pipe.u_w_per_m2k > 1, "u_w_per_m2k"] *= 0.1
 
@@ -172,18 +212,21 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
             if net6.converged:
                 logger.info(
                     "If pipe heat transfer coefficients above 1 W/(m²K) were reduced "
-                    "by factor 0.1, the pipeflow would converge.")
-        except Exception as e:
+                    "by factor 0.1, the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
             logger.info(
-                "Pipeflow does not converge even if pipe heat transfer coefficients "
-                "above 1 W/(m²K) are reduced by factor 0.1.\n"
-                f"\t\tThe error message is: {e}")
-
-
+                "Pipeflow still does not converge if pipe heat transfer coefficients "
+                "above 1 W/(m²K) are reduced by factor 0.1."
+            )
+        except Exception as e:
+            logger.warning(
+                "The heat-transfer-coefficient check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check with all valves opened
     if not net.valve.empty and (~net.valve.opened).any():
-        logger.info("Testing with all valves opened.")
         net7 = net.deepcopy()
         net7.valve.opened = True
 
@@ -193,12 +236,15 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                 logger.info(
                     "If all valves were opened, the pipeflow would converge."
                 )
-        except Exception  as e:
+        except PipeflowNotConverged:
             logger.info(
-                "Pipeflow does not converge even if all valves are opened.\n"
+                "Pipeflow still does not converge if all valves are opened."
+            )
+        except Exception as e:
+            logger.warning(
+                "The valve-opening check failed.\n"
                 f"\t\tThe error message is: {e}"
             )
-
 
     # check heat consumer control parameters
     # The idea is to reduce the thermal load of the heat consumers.
@@ -210,9 +256,6 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
     if hasattr(net, "heat_consumer") and not net.heat_consumer.empty:
         logger.info("Testing with adjusted heat consumer control parameters.")
         net8 = net.deepcopy()
-
-        heat_consumer_scaling_factor = 0.1
-        deltat_scaling_factor = 2
 
         # combination 1: qext_w + controlled_mdot_kg_per_s
         # reduce heat demand and mass flow
@@ -248,7 +291,7 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                 & net8.heat_consumer.treturn_k.notna()
         )
 
-        net8.heat_consumer.loc[ mask_qext_treturn, "qext_w"] *= heat_consumer_scaling_factor
+        net8.heat_consumer.loc[mask_qext_treturn, "qext_w"] *= heat_consumer_scaling_factor
 
         # combination 4: controlled_mdot_kg_per_s + deltat_k
         # reduce mass flow and increase deltaT
@@ -259,7 +302,7 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                 & net8.heat_consumer.treturn_k.isna()
         )
 
-        net8.heat_consumer.loc[ mask_mdot_deltat, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
+        net8.heat_consumer.loc[mask_mdot_deltat, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
         net8.heat_consumer.loc[mask_mdot_deltat, "deltat_k"] *= deltat_scaling_factor
 
         # combination 5: controlled_mdot_kg_per_s + treturn_k
@@ -272,23 +315,27 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
         )
 
         net8.heat_consumer.loc[mask_mdot_treturn, "controlled_mdot_kg_per_s"] *= heat_consumer_scaling_factor
-
         try:
             pp.pipeflow(net8)
             if net8.converged:
-                logger.info("If heat consumer control parameters were adjusted, "
-                    "the pipeflow would converge.")
-
+                logger.info(
+                    "If heat consumer control parameters were adjusted, "
+                    "the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
+            logger.info(
+                "Pipeflow still does not converge if heat consumer control "
+                "parameters are adjusted."
+            )
         except Exception as e:
-            logger.info("Pipeflow does not converge even if heat consumer control "
-                f"parameters are adjusted.\n\t\tThe error message is: {e}")
-
+            logger.warning(
+                "The heat-consumer control-parameter check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check with flattened junction heights
     if net.junction.height_m.nunique() > 1:
-        logger.info("Testing with flattened junction heights.")
         net9 = net.deepcopy()
-
         net9.junction.height_m = 0
 
         try:
@@ -296,23 +343,24 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
             if net9.converged:
                 logger.info(
                     "If all junction heights were set to 0 m, "
-                    "the pipeflow would converge.")
-
-        except Exception as e:
+                    "the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
             logger.info(
-                "Pipeflow does not converge even if all junction heights "
-                "are set to 0 m.\n"
+                "Pipeflow still does not converge if all junction heights "
+                "are set to 0 m."
+            )
+        except Exception as e:
+            logger.warning(
+                "The junction-height check failed.\n"
                 f"\t\tThe error message is: {e}"
             )
-
 
     # check convergence in different calculation modes
     # Note: Heat mode cannot be executed independently because it requires
     # hydraulic results (node pressures and branch mass flows) as input.
     # Therefore, a hydraulic calculation is performed first and the resulting
     # PINIT and MDOTINIT values are passed to the heat calculation via sol_vec.
-    logger.info("Testing convergence in different calculation modes.")
-
     for mode in ["hydraulics", "heat", "sequential", "bidirectional"]:
         net11 = net.deepcopy()
 
@@ -331,55 +379,59 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
             if net11.converged:
                 logger.info(f"The pipeflow converges in mode '{mode}'.")
 
+        except PipeflowNotConverged:
+            logger.info(f"Pipeflow still does not converge in mode '{mode}'.")
+
         except Exception as e:
-            logger.info(
-                f"Pipeflow does not converge in mode '{mode}'.\n"
+            logger.warning(
+                f"The calculation-mode check failed for mode '{mode}'.\n"
                 f"\t\tThe error message is: {e}")
 
-
     # check with changed friction model
-    logger.info("Testing with changed friction models.")
-
     for friction_model in ["nikuradse", "colebrook", "swamee-jain"]:
         net12 = net.deepcopy()
 
         try:
             pp.pipeflow(net12, friction_model=friction_model)
-            if net.converged:
+            if net12.converged:
                 logger.info(
                     f"The pipeflow converges with friction model '{friction_model}'.")
 
-        except Exception as e:
+        except PipeflowNotConverged:
             logger.info(
-                f"Pipeflow does not converge with friction model '{friction_model}'.\n"
+                f"Pipeflow still does not converge with friction model "
+                f"'{friction_model}'.")
+        except Exception as e:
+            logger.warning(
+                f"The friction-model check failed for '{friction_model}'.\n"
                 f"\t\tThe error message is: {e}")
-
-
 
     # check convergence without compressor pressure lift
     if hasattr(net, "compressor") and not net.compressor.empty:
-        logger.info("Testing without compressor pressure lift.")
 
         net13 = net.deepcopy()
         net13.compressor.pressure_ratio = 1
 
         try:
             pp.pipeflow(net13)
-            if net.converged:
+            if net13.converged:
                 logger.info(
                     "If compressor pressure ratios were set to 1, "
-                    "the pipeflow would converge.")
-
-        except Exception  as e:
+                    "the pipeflow would converge."
+                )
+        except PipeflowNotConverged:
             logger.info(
-                "Pipeflow does not converge even if compressor pressure ratios "
-                "are set to 1.\n"
-                f"\t\tThe error message is: {e}")
+                "Pipeflow still does not converge if compressor pressure ratios "
+                "are set to 1."
+            )
+        except Exception as e:
+            logger.warning(
+                "The compressor-pressure-ratio check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
     # check with inactive pressure controls
     if hasattr(net, "press_control") and not net.press_control.empty:
-        logger.info("Testing with inactive pressure controls.")
-
         net14 = net.deepcopy()
         net14.press_control.control_active = False
 
@@ -390,13 +442,16 @@ def check_net(net, low_length_limit_km=0.01, check_scaling_factor=1e-5):
                     "If all pressure controls were deactivated, "
                     "the pipeflow would converge."
                 )
-
-        except Exception  as e:
+        except PipeflowNotConverged:
             logger.info(
-                "Pipeflow does not converge even if all pressure controls "
-                f"are deactivated.\n\t\tThe error message is: {e}"
+                "Pipeflow still does not converge if all pressure controls "
+                "are deactivated."
             )
-
+        except Exception as e:
+            logger.warning(
+                "The pressure-control check failed.\n"
+                f"\t\tThe error message is: {e}"
+            )
 
 
 def pipeflow_alpha_sweep(net, **kwargs):
@@ -421,4 +476,3 @@ def pipeflow_alpha_sweep(net, **kwargs):
             logger.info(f"Pipeflow did converge with alpha = {alpha}.")
             return
     logger.warning(f"Pipeflow did not converge with any alpha in {alphas}.")
-    
