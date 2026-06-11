@@ -1,0 +1,1432 @@
+import pandapipes as pp
+import numpy as np
+import pandas as pd
+
+from pandapipes import PipeflowNotConverged
+from pandapipes.idx_node import PINIT
+from pandapipes.idx_branch import MDOTINIT
+from pandapipes.diagnostic.diagnostic_helper import (
+    DiagnosticFunction,
+    check_boolean,
+    check_greater_equal_zero,
+    check_greater_zero,
+    check_number,
+    check_pos_int,
+    check_existing_junction,
+)
+
+try:
+    import pandaplan.core.pplog as logging
+except ImportError:
+    import logging
+
+logger = logging.getLogger(__name__)
+
+
+
+
+default_argument_values = {
+    "low_length_limit_km": 0.01,
+    "iteration_limit": 200,
+
+    "sink_source_scaling_factor": 1e-5,
+
+    "roughness_limit_mm": 0.5,
+    "reduced_k_mm": 1e-5,
+
+    "gas_diameter_threshold_mm": 6,
+    "liquid_diameter_threshold_mm": 20,
+    "diameter_increase_factor": 2,
+
+    "heat_transfer_coefficient_limit": 5,
+    "heat_transfer_coefficient_scaling_factor": 0.1,
+
+    "heat_consumer_scaling_factor": 0.1,
+    "deltat_scaling_factor": 2,
+
+    "compressor_neutral_pressure_ratio": 1,
+
+    "alpha_min": 0.1,
+    "alpha_max": 1.0,
+    "alpha_step": 0.1,
+}
+
+
+
+class InvalidValuesCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        result = {}
+
+        important_values = {
+            "junction": [
+                ("pn_bar", ">0"),
+                ("tfluid_k", ">0"),
+                ("height_m", ">=0"),
+            ],
+            "pipe": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("length_km", ">0"),
+                ("inner_diameter_mm", ">0"),
+                ("k_mm", ">0"),
+                ("alpha_w_per_m2k", ">=0"),
+                ("loss_coefficient", ">=0"),
+                ("sections", "positive_integer"),
+                ("in_service", "boolean"),
+            ],
+            "ext_grid": [
+                ("junction", "existing_junction"),
+                ("p_bar", ">0"),
+                ("t_k", ">0"),
+            ],
+            "sink": [
+                ("junction", "existing_junction"),
+                ("mdot_kg_per_s", ">=0"),
+                ("scaling", ">=0"),
+                ("in_service", "boolean"),
+            ],
+            "source": [
+                ("junction", "existing_junction"),
+                ("mdot_kg_per_s", ">=0"),
+                ("scaling", ">=0"),
+                ("in_service", "boolean"),
+            ],
+            "valve": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("diameter_m", ">0"),
+                ("loss_coefficient", ">=0"),
+                ("opened", "boolean"),
+                ("in_service", "boolean"),
+            ],
+            "pump": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("in_service", "boolean"),
+            ],
+            "compressor": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("pressure_ratio", ">0"),
+                ("in_service", "boolean"),
+            ],
+            "press_control": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("controlled_junction", "existing_junction"),
+                ("controlled_p_bar", ">0"),
+                ("control_active", "boolean"),
+                ("in_service", "boolean"),
+            ],
+            "flow_control": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("controlled_mdot_kg_per_s", ">0"),
+                ("control_active", "boolean"),
+                ("in_service", "boolean"),
+            ],
+            "circ_pump_pressure": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("p_flow_bar", ">0"),
+                ("t_flow_k", ">0"),
+                ("in_service", "boolean"),
+            ],
+            "circ_pump_mass": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("mdot_flow_kg_per_s", ">0"),
+                ("p_flow_bar", ">0"),
+                ("t_flow_k", ">0"),
+                ("in_service", "boolean"),
+            ],
+            "heat_consumer": [
+                ("from_junction", "existing_junction"),
+                ("to_junction", "existing_junction"),
+                ("qext_w", "number"),
+                ("controlled_mdot_kg_per_s", ">0"),
+                ("deltat_k", ">0"),
+                ("treturn_k", ">=0"),
+                ("scaling", ">=0"),
+                ("in_service", "boolean"),
+            ],
+        }
+
+        type_checks = {
+            ">0": check_greater_zero,
+            ">=0": check_greater_equal_zero,
+            "number": check_number,
+            "boolean": check_boolean,
+            "positive_integer": check_pos_int,
+            "existing_junction": check_existing_junction,
+        }
+
+
+        for element, checks in important_values.items():
+            if not hasattr(net, element):
+                continue
+
+            table = net[element]
+
+            if table.empty:
+                continue
+
+            for idx, row in table.iterrows():
+                for column, restriction in checks:
+                    if column not in table.columns:
+                        continue
+
+                    value = row[column]
+
+                    # heat_consumer has optional control columns; NaN can be valid there
+                    if element == "heat_consumer" and column in [
+                        "qext_w",
+                        "controlled_mdot_kg_per_s",
+                        "deltat_k",
+                        "treturn_k",
+                    ]:
+                        if pd.isna(value):
+                            continue
+
+                    if restriction == "existing_junction":
+                        check_result = type_checks[restriction](
+                            row, idx, column, net.junction.index
+                        )
+                    else:
+                        check_result = type_checks[restriction](
+                            row, idx, column
+                        )
+
+                    if check_result is not None:
+                        result.setdefault(element, []).append(
+                            (idx, column, value, restriction)
+                        )
+
+        return result if result else None
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning("Invalid-values check failed due to the following error:")
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        self.out.warning("invalid_values:")
+
+        for element, violations in result.items():
+            self.out.warning(f"{element}:")
+
+            for idx, column, value, restriction in violations:
+                self.out.warning(
+                    f"{element} {idx}: '{column}' = {value} "
+                    f"(restriction: {restriction})"
+                )
+
+
+# check ext_grid
+class MissingExtGridCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        if net.fluid.is_gas and (
+            not hasattr(net, "ext_grid") or net.ext_grid.empty
+        ):
+            return True
+
+        return None
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Missing ext_grid check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        self.out.warning(
+            "The net does not have an external grid! "
+            "An external grid is required for gas networks."
+        )
+
+
+
+# check zero / low length
+class ShortPipeLengthCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+
+        self.low_length_limit_km = None
+        self.zero_length_pipes = None
+        self.low_length_pipes = None
+
+    def diagnostic(self, net, **kwargs):
+        self.low_length_limit_km = kwargs["low_length_limit_km"]
+        self.zero_length_pipes = net.pipe.loc[
+            net.pipe.length_km == 0
+        ]
+
+        self.low_length_pipes = net.pipe.loc[
+            net.pipe.length_km <= self.low_length_limit_km
+        ]
+
+        if self.low_length_pipes.empty:
+            return None
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return {"short_pipes_found": True, "convergence_test": None}
+
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.pipe.loc[
+            net2.pipe.length_km <= self.low_length_limit_km,
+            "length_km"
+        ] = self.low_length_limit_km
+
+        try:
+            pp.pipeflow(net2)
+            return {
+                "short_pipes_found": True,
+                "convergence_test": net2.converged
+            }
+
+        except PipeflowNotConverged:
+            return {
+                "short_pipes_found": True,
+                "convergence_test": False
+            }
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Short-pipeline-length check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        if self.zero_length_pipes is not None and not self.zero_length_pipes.empty:
+            self.out.warning(
+                f"{len(self.zero_length_pipes.index)} pipes have a length of 0.0 km. "
+                f"(IDs: {list(self.zero_length_pipes.index)})"
+            )
+
+        if self.low_length_pipes is not None and not self.low_length_pipes.empty:
+            self.out.warning(
+                f"{len(self.low_length_pipes.index)} pipes have a length below or equal to "
+                f"{self.low_length_limit_km} km. This could lead to convergence issues. "
+                f"The lowest length in the net is {self.low_length_pipes.length_km.min()} km. "
+                f"(IDs: {list(self.low_length_pipes.index)})"
+            )
+
+        convergence_test = result.get("convergence_test")
+
+        if convergence_test is None:
+            return
+
+        if convergence_test:
+            self.out.warning(
+                f"Pipe-length problem suspected: pipeflow converges if all short pipelines "
+                f"(< {self.low_length_limit_km} km) are set to {self.low_length_limit_km} km."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if all short pipelines "
+                f"(< {self.low_length_limit_km} km) are set to {self.low_length_limit_km} km."
+            )
+
+# check iterations
+class IterationCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+
+        self.iterations = None
+
+    def diagnostic(self, net, **kwargs):
+        self.iterations = kwargs["iteration_limit"]
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net2, iter=self.iterations)
+            return True
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Iteration check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking iteration limit...\n")
+
+        if result:
+            self.out.warning(
+                f"The pipeflow converges if the maximum number of iterations "
+                f"is increased to {self.iterations}."
+            )
+        else:
+            self.out.warning(
+                f"After {self.iterations:d} iterations "
+                f"the pipeflow did NOT converge."
+            )
+
+# check with little sink and source scaling
+class SinkSourceScalingCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+
+        self.scaling_factor = None
+
+    def diagnostic(self, net, **kwargs):
+        self.scaling_factor = kwargs["sink_source_scaling_factor"]
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        if not hasattr(net, "sink") and not hasattr(net, "source"):
+            return None
+
+        net2 = net.deepcopy()
+
+        if hasattr(net2, "sink"):
+            net2.sink.scaling *= self.scaling_factor
+
+        if hasattr(net2, "source"):
+            net2.source.scaling *= self.scaling_factor
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Sink/source scaling check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        if result:
+            self.out.warning(
+                f"If sinks and sources were scaled by a factor of "
+                f"{self.scaling_factor}, the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if sinks and sources are "
+                f"scaled by a factor of {self.scaling_factor}."
+            )
+
+
+# check k
+class PipeRoughnessCheck(DiagnosticFunction):
+
+    def __init__(self):
+
+        super().__init__()
+        self.reduced_k_mm = None
+        self.roughness_limit_mm = None
+        self.rough_pipes = None
+
+    def diagnostic(self, net, **kwargs):
+
+        self.reduced_k_mm = kwargs["reduced_k_mm"]
+        self.roughness_limit_mm = kwargs["roughness_limit_mm"]
+
+        self.rough_pipes = net.pipe.loc[
+            net.pipe.k_mm > self.roughness_limit_mm
+        ]
+
+        if self.rough_pipes.empty:
+            return None
+
+        result = {
+            "rough_pipes_found": True,
+            "convergence_test": None
+        }
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return result
+
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+
+        net2.pipe.loc[
+            net2.pipe.k_mm > self.roughness_limit_mm,
+            "k_mm"
+        ] = self.reduced_k_mm
+
+        try:
+            pp.pipeflow(net2)
+            result["convergence_test"] = net2.converged
+
+        except PipeflowNotConverged:
+            result["convergence_test"] = False
+
+        except Exception:
+            raise
+
+        return result
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning("Pipe-roughness check failed due to the following error:")
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        self.out.warning(
+            f"Some pipes have k_mm > {self.roughness_limit_mm} mm. "
+            f"The highest k_mm in the net is {self.rough_pipes.k_mm.max()} mm.\n"
+            f"Rough pipe IDs: {list(self.rough_pipes.index)}"
+        )
+
+        convergence_test = result["convergence_test"]
+
+        if convergence_test is None:
+            return
+
+        logger.detailed("Checking pipe roughness...\n")
+        if convergence_test:
+            self.out.warning(
+                f"Pipe-roughness problem suspected: pipeflow converges if rough pipes "
+                f"with k_mm > {self.roughness_limit_mm} mm are reduced to "
+                f"{self.reduced_k_mm} mm."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if rough pipes with "
+                f"k_mm > {self.roughness_limit_mm} mm are reduced to "
+                f"{self.reduced_k_mm} mm."
+            )
+
+
+# check sink and source junctions:
+class MissingNodeJunctionsCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        node_components = ["sink", "source", "ext_grid"]
+        result = {}
+
+        for nc in node_components:
+            if hasattr(net, nc):
+                missing = np.setdiff1d(net[nc].junction, net.junction.index)
+
+                if len(missing):
+                    result[nc] = {
+                        "missing_junctions": missing,
+                        "elements": net[nc].loc[net[nc].junction.isin(missing)]
+                    }
+
+        return result if result else None
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Node-junction check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        for nc, values in result.items():
+            self.out.warning(
+                f"Some {nc}s are connected to non-existing junctions!"
+                f"\n{nc}s:{values['elements']}"
+                f"\nmissing junctions:{values['missing_junctions']}"
+            )
+
+
+# check from and to junctions
+class MissingBranchJunctionsCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        branch_components = ["pipe", "valve", "compressor", "pump", "heat_exchanger", "circ_pump_pressure", "circ_pump_mass"]
+        result = {}
+
+        for bc in branch_components:
+            if not hasattr(net, bc):
+                continue
+
+            table = net[bc]
+
+            if table.empty:
+                continue
+
+            if "from_junction" not in table.columns or "to_junction" not in table.columns:
+                continue
+
+            missing_f = np.setdiff1d(table.from_junction, net.junction.index)
+            missing_t = np.setdiff1d(table.to_junction, net.junction.index)
+
+            if len(missing_f) or len(missing_t):
+                result[bc] = {
+                    "missing_from_junctions": missing_f,
+                    "missing_to_junctions": missing_t
+                }
+
+        return result if result else None
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning("Branch-junction check failed due to the following error:")
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        for bc, values in result.items():
+            self.out.warning(f"Some {bc}s are connected to non-existing junctions!")
+            self.out.warning(f"missing 'from' junctions: {values['missing_from_junctions']}")
+            self.out.warning(f"missing 'to' junctions: {values['missing_to_junctions']}")
+
+
+# check with increased pipe inner_diameter_mm
+class PipeDiameterCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+        self.diameter_increase_factor = None
+        self.diameter_threshold_mm = None
+
+    def diagnostic(self, net, **kwargs):
+        self.diameter_increase_factor = kwargs["diameter_increase_factor"]
+
+        if not hasattr(net, "pipe") or net.pipe.empty:
+            return None
+
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+
+        except PipeflowNotConverged:
+            pass
+
+        # Only now check whether there are very small pipes.
+        if net.fluid.is_gas:
+            self.diameter_threshold_mm = kwargs["gas_diameter_threshold_mm"]
+        else:
+            self.diameter_threshold_mm = kwargs["liquid_diameter_threshold_mm"]
+
+        small_pipes = net.pipe.inner_diameter_mm < self.diameter_threshold_mm
+
+        if not small_pipes.any():
+            return None
+
+        # Test whether increasing small pipe diameters helps.
+        net2 = net.deepcopy()
+        net2.pipe.loc[
+            small_pipes,
+            "inner_diameter_mm"
+        ] *= self.diameter_increase_factor
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning("Pipe-diameter check failed due to the following error:")
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking heat-transfer coefficients...\n")
+        if result:
+            self.out.warning(
+                f"Pipe-diameter problem suspected: "
+                f"pipeflow converges if pipe diameters below "
+                f"{self.diameter_threshold_mm} mm are increased by factor "
+                f"{self.diameter_increase_factor}."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if pipe diameters below "
+                f"{self.diameter_threshold_mm} mm are increased by factor "
+                f"{self.diameter_increase_factor}."
+            )
+
+# check heat transfer coefficient
+class HeatTransferCoefficientCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+        self.limit = None
+        self.scaling_factor = None
+
+    def diagnostic(self, net, **kwargs):
+
+        self.limit = kwargs["heat_transfer_coefficient_limit"]
+        self.scaling_factor = kwargs["heat_transfer_coefficient_scaling_factor"]
+
+        if (
+            not hasattr(net, "pipe")
+            or net.pipe.empty
+            or "u_w_per_m2k" not in net.pipe.columns
+        ):
+            return None
+
+        if not (net.pipe.u_w_per_m2k > self.limit).any():
+            return None
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.pipe.loc[
+            net2.pipe.u_w_per_m2k > self.limit,
+            "u_w_per_m2k"
+        ] *= self.scaling_factor
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Heat-transfer-coefficient check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking heat-transfer coefficients...\n")
+
+        if result:
+            self.out.warning(
+                f"If pipe heat transfer coefficients above {self.limit} W/(m²K) were reduced "
+                f"by factor {self.scaling_factor}, the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if pipe heat transfer coefficients "
+                f"above {self.limit} W/(m²K) are reduced by factor {self.scaling_factor}."
+            )
+
+# check with all valves opened
+class ValveOpeningCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        if (not hasattr(net, "valve") or net.valve.empty or not (~net.valve.opened).any()):
+            return None
+
+        # check original network first
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.valve.opened = True
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+
+        if error is not None:
+            self.out.warning(
+                "Valve-opening check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking valve configuration...\n")
+
+        if result:
+            self.out.warning(
+                "If all valves were opened, the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                "Pipeflow still does not converge if all valves are opened."
+            )
+
+class HeatConsumerControlParameterCheck(DiagnosticFunction):
+    """
+    Checks whether heat consumer control parameters are the reason
+    for the pipeflow non-convergence.
+
+    The idea is to reduce the thermal load of the heat consumers.
+    Lower heat demand (qext_w) and mass flow
+    (controlled_mdot_kg_per_s) reduce the hydraulic and thermal
+    stress on the network.
+
+    For configurations using deltat_k, the temperature difference
+    is increased to reduce the required mass flow according to
+
+    Q = m * cp * deltaT
+    """
+    def __init__(self):
+        super().__init__()
+        self.heat_consumer_scaling_factor = None
+        self.deltat_scaling_factor = None
+        self.affected_heat_consumers = None
+
+    def diagnostic(self, net, **kwargs):
+
+        self.heat_consumer_scaling_factor = kwargs["heat_consumer_scaling_factor"]
+        self.deltat_scaling_factor = kwargs["deltat_scaling_factor"]
+
+        if not hasattr(net, "heat_consumer") or net.heat_consumer.empty:
+            return None
+
+        net0 = net.deepcopy()
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        hc = net2.heat_consumer
+
+        # combination 1: qext_w + controlled_mdot_kg_per_s
+        # reduce heat demand and mass flow
+        mask_qext_mdot = (
+            hc.qext_w.notna()
+            & hc.controlled_mdot_kg_per_s.notna()
+            & hc.deltat_k.isna()
+            & hc.treturn_k.isna()
+        )
+
+        # combination 2: qext_w + deltat_k
+        # reduce heat demand and increase deltaT
+        mask_qext_deltat = (
+            hc.qext_w.notna()
+            & hc.controlled_mdot_kg_per_s.isna()
+            & hc.deltat_k.notna()
+            & hc.treturn_k.isna()
+        )
+
+        # combination 3: qext_w + treturn_k
+        # reduce heat demand
+        mask_qext_treturn = (
+            hc.qext_w.notna()
+            & hc.controlled_mdot_kg_per_s.isna()
+            & hc.deltat_k.isna()
+            & hc.treturn_k.notna()
+        )
+
+        # combination 4: controlled_mdot_kg_per_s + deltat_k
+        # reduce mass flow and increase deltaT
+        mask_mdot_deltat = (
+            hc.qext_w.isna()
+            & hc.controlled_mdot_kg_per_s.notna()
+            & hc.deltat_k.notna()
+            & hc.treturn_k.isna()
+        )
+
+        # combination 5: controlled_mdot_kg_per_s + treturn_k
+        # reduce mass flow
+        mask_mdot_treturn = (
+            hc.qext_w.isna()
+            & hc.controlled_mdot_kg_per_s.notna()
+            & hc.deltat_k.isna()
+            & hc.treturn_k.notna()
+        )
+
+        affected_mask = (
+            mask_qext_mdot
+            | mask_qext_deltat
+            | mask_qext_treturn
+            | mask_mdot_deltat
+            | mask_mdot_treturn
+        )
+
+        self.affected_heat_consumers = hc.index[affected_mask].tolist()
+
+        hc.loc[mask_qext_mdot, "qext_w"] *= self.heat_consumer_scaling_factor
+        hc.loc[mask_qext_mdot, "controlled_mdot_kg_per_s"] *= self.heat_consumer_scaling_factor
+
+        hc.loc[mask_qext_deltat, "qext_w"] *= self.heat_consumer_scaling_factor
+        hc.loc[mask_qext_deltat, "deltat_k"] *= self.deltat_scaling_factor
+
+        hc.loc[mask_qext_treturn, "qext_w"] *= self.heat_consumer_scaling_factor
+
+        hc.loc[mask_mdot_deltat, "controlled_mdot_kg_per_s"] *= self.heat_consumer_scaling_factor
+        hc.loc[mask_mdot_deltat, "deltat_k"] *= self.deltat_scaling_factor
+
+        hc.loc[mask_mdot_treturn, "controlled_mdot_kg_per_s"] *= self.heat_consumer_scaling_factor
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+        except PipeflowNotConverged:
+            return False
+        except Exception as e:
+            raise e
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Heat-consumer control-parameter check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        self.out.warning("Testing with adjusted heat consumer control parameters.")
+
+        if self.affected_heat_consumers is not None:
+            self.out.warning(f"Adjusted heat consumer IDs: {self.affected_heat_consumers}")
+
+        if result:
+            self.out.warning(
+                "If heat consumer control parameters were adjusted, "
+                "the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                "Pipeflow still does not converge if heat consumer control "
+                "parameters are adjusted."
+            )
+
+# check with flattened junction heights
+class JunctionHeightCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        if net.junction.height_m.nunique() <= 1:
+            return None
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.junction.height_m = 0
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Junction-height check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed(
+            "Checking junction-height configuration...\n"
+        )
+        if result:
+            self.out.warning(
+                "If all junction heights were set to 0 m, "
+                "the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                "Pipeflow still does not converge if all junction heights "
+                "are set to 0 m."
+            )
+
+
+class CalculationModeCheck(DiagnosticFunction):
+    """
+    Checks whether the non-convergence originates from hydraulics,
+    heat transfer, or the coupling between both calculations.
+
+    Heat mode cannot be executed independently because it requires
+    hydraulic results (node pressures and branch mass flows) as input.
+    Therefore, a hydraulic calculation is executed first and the
+    resulting PINIT and MDOTINIT values are passed to the heat
+    calculation via sol_vec.
+    """
+    def __init__(self, modes=None):
+        super().__init__()
+        self.modes = modes or ["hydraulics", "heat", "sequential", "bidirectional"]
+
+    def diagnostic(self, net, **kwargs):
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        results = {}
+
+        for mode in self.modes:
+            net2 = net.deepcopy()
+
+            try:
+                if mode == "heat":
+                    pp.pipeflow(net2, mode="hydraulics")
+                    sol_vec = np.r_[
+                        net2["_pit"]["node"][:, PINIT],
+                        net2["_pit"]["branch"][:, MDOTINIT]
+                    ]
+                    pp.pipeflow(net2, mode="heat", sol_vec=sol_vec)
+                else:
+                    pp.pipeflow(net2, mode=mode)
+
+                results[mode] = net2.converged
+
+            except PipeflowNotConverged:
+                results[mode] = False
+
+            except Exception:
+                raise
+
+        return results
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Calculation-mode check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking calculation modes...\n")
+
+        for mode, converged in result.items():
+            if converged:
+                self.out.warning(
+                    f"The pipeflow converges in mode '{mode}'."
+                )
+            else:
+                self.out.warning(
+                    f"Pipeflow still does not converge in mode '{mode}'."
+                )
+
+
+# check with changed friction model
+class FrictionModelCheck(DiagnosticFunction):
+
+    def __init__(self, friction_models=None):
+        super().__init__()
+        self.friction_models = friction_models or ["nikuradse", "colebrook", "swamee-jain"]
+
+    def diagnostic(self, net, **kwargs):
+        # First check the original pipeflow.
+        # If it already converges, this comparison is not needed.
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        results = {}
+
+        for friction_model in self.friction_models:
+            net2 = net.deepcopy()
+
+            try:
+                pp.pipeflow(net2, friction_model=friction_model)
+                results[friction_model] = net2.converged
+
+            except PipeflowNotConverged:
+                results[friction_model] = False
+
+            except Exception:
+                raise
+
+        return results
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning("Friction-model check failed due to the following error:")
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking friction models...\n")
+
+        for friction_model, converged in result.items():
+            if converged:
+                self.out.warning(
+                    f"Friction-model dependency suspected: "
+                    f"pipeflow converges with friction model '{friction_model}'."
+                )
+            else:
+                self.out.warning(
+                    f"Pipeflow still does not converge with friction model "
+                    f"'{friction_model}'."
+                )
+
+class AlphaSweepCheck(DiagnosticFunction):
+    """
+    Checks whether the pipeflow converges with a different Newton damping factor alpha.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.alphas = None
+        self.successful_alpha = None
+
+    def diagnostic(self, net, **kwargs):
+        alpha_min = kwargs["alpha_min"]
+        alpha_max = kwargs["alpha_max"]
+        alpha_step = kwargs["alpha_step"]
+
+        # First check the original pipeflow.
+        # If it already converges, this check is not needed.
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        # Build alpha list similar to the original helper function.
+        # Example: [1.0, 0.9, 0.1, 0.8, 0.2, ...]
+        high_values = np.arange(alpha_max, alpha_min - alpha_step / 2, -alpha_step)
+        low_values = np.arange(alpha_min, alpha_max + alpha_step / 2, alpha_step)
+
+        self.alphas = []
+        for high, low in zip(high_values, low_values):
+            high = round(float(high), 10)
+            low = round(float(low), 10)
+
+            if high not in self.alphas:
+                self.alphas.append(high)
+
+            if low not in self.alphas:
+                self.alphas.append(low)
+
+        for alpha in self.alphas:
+            net2 = net.deepcopy()
+
+            try:
+                pp.pipeflow(net2, alpha=alpha)
+
+                if net2.converged:
+                    self.successful_alpha = alpha
+                    return True
+
+            except PipeflowNotConverged:
+                pass
+
+            except Exception:
+                raise
+
+        return False
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Alpha-sweep check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        if result:
+            self.out.warning(
+                f"Pipeflow converges with alpha = {self.successful_alpha}."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow did not converge with any alpha in {self.alphas}."
+            )
+
+# check with inactive pressure controls
+class InactivePressureControlsCheck(DiagnosticFunction):
+
+    def diagnostic(self, net, **kwargs):
+        if not hasattr(net, "press_control") or net.press_control.empty:
+            return None
+
+        # first check original network
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+
+            if net0.converged:
+                return None
+
+        except PipeflowNotConverged:
+            pass
+
+        # hypothesis test
+        net2 = net.deepcopy()
+        net2.press_control.control_active = False
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Inactive-pressure-controls check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed(
+            "Checking pressure-control configuration...\n"
+        )
+
+        if result:
+            self.out.warning(
+                "If all pressure controls were deactivated, "
+                "the pipeflow would converge."
+            )
+        else:
+            self.out.warning(
+                "Pipeflow still does not converge if all pressure controls "
+                "are deactivated."
+            )
+
+# check with inactive pressure controls
+class CompressorPressureRatioCheck(DiagnosticFunction):
+    """
+    Checks whether compressor pressure lift is the reason for non-convergence
+    by temporarily setting all compressor pressure ratios to 1.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.neutral_pressure_ratio = None
+
+    def diagnostic(self, net, **kwargs):
+        self.neutral_pressure_ratio = kwargs["compressor_neutral_pressure_ratio"]
+
+        if not hasattr(net, "compressor") or net.compressor.empty:
+            return None
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.compressor.pressure_ratio = self.neutral_pressure_ratio
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+
+        if error is not None:
+            self.out.warning(
+                "Compressor pressure-ratio check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed(
+            "Checking compressor pressure ratios...\n"
+        )
+
+        if result:
+            self.out.warning(
+                "Compressor pressure-ratio problem suspected: "
+                "pipeflow converges if all compressor pressure ratios are set to 1."
+            )
+        else:
+            self.out.warning(
+                "Pipeflow still does not converge if all compressor pressure ratios are set to 1."
+            )
+
+
+
+def pipeflow_alpha_sweep(net, **kwargs):
+    """Run the pipeflow many times with different alpha (NR damping factor) settings between 0.1 and 1 in steps of 0.1"""
+    net.converged = False
+    alphas = [1]
+    for i in range(1, 10):
+        if i % 2 == 1:
+            alphas.append(round(1 - (i // 2) * 0.1, 1))
+        else:
+            alphas.append(round((i // 2) * 0.1, 1))
+    if kwargs is None:
+        kwargs = {}
+
+    for alpha in alphas:
+        kwargs.update({"alpha": alpha})
+        try:
+            pp.pipeflow(net, **kwargs)
+        except Exception as e:
+            logger.debug(f"Pipeflow did not converge with alpha = {alpha}.\nError: {e}")
+        if net.converged:
+            logger.info(f"Pipeflow did converge with alpha = {alpha}.")
+            return
+    logger.warning(f"Pipeflow did not converge with any alpha in {alphas}.")
+
+
+
+default_diagnostic_functions = [
+    ("invalid_values", InvalidValuesCheck(), []),
+    ("missing_ext_grid", MissingExtGridCheck(), []),
+    ("short_pipe_length", ShortPipeLengthCheck(), None),
+    ("iteration_check", IterationCheck(), None),
+    ("sink_source_scaling", SinkSourceScalingCheck(), None),
+    ("pipe_roughness", PipeRoughnessCheck(), None),
+    ("missing_node_junctions", MissingNodeJunctionsCheck(), []),
+    ("missing_branch_junctions", MissingBranchJunctionsCheck(), []),
+    ("pipe_diameter", PipeDiameterCheck(), None),
+    ("heat_transfer_coefficient", HeatTransferCoefficientCheck(), None),
+    ("valve_opening", ValveOpeningCheck(), []),
+    ("heat_consumer_control_parameter", HeatConsumerControlParameterCheck(), None),
+    ("junction_height", JunctionHeightCheck(), []),
+    ("calculation_mode", CalculationModeCheck(), []),
+    ("friction_model", FrictionModelCheck(), []),
+    ("alpha_sweep", AlphaSweepCheck(), None),
+    ("compressor_pressure_ratio", CompressorPressureRatioCheck(), []),
+    ("inactive_pressure_controls", InactivePressureControlsCheck(), []),
+]
