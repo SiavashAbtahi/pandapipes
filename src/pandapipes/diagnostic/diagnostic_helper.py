@@ -68,7 +68,7 @@ def check_greater_zero(element, element_index, column):
 
 def check_pos_int(element, element_index, column):
     if check_number(element, element_index, column) is None:
-        if not ((element[column] % 1 == 0) and element[column] >= 0):
+        if not ((element[column] % 1 == 0) and element[column] > 0):
             return element_index
     else:
         return element_index

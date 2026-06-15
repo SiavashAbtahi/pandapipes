@@ -1427,6 +1427,6 @@ default_diagnostic_functions = [
     ("calculation_mode", CalculationModeCheck(), []),
     ("friction_model", FrictionModelCheck(), []),
     ("alpha_sweep", AlphaSweepCheck(), None),
-    ("compressor_pressure_ratio", CompressorPressureRatioCheck(), []),
+    ("compressor_pressure_ratio", CompressorPressureRatioCheck(), None),
     ("inactive_pressure_controls", InactivePressureControlsCheck(), []),
 ]
