@@ -46,6 +46,9 @@ default_argument_values = {
 
     "compressor_neutral_pressure_ratio": 1,
 
+    "gas_ext_grid_standard_pressure_bar": 5,
+    "liquid_ext_grid_standard_pressure_bar": 5,
+
     "alpha_min": 0.1,
     "alpha_max": 1.0,
     "alpha_step": 0.1,
@@ -1383,31 +1386,76 @@ class CompressorPressureRatioCheck(DiagnosticFunction):
                 "Pipeflow still does not converge if all compressor pressure ratios are set to 1."
             )
 
+# check with standard ext_grid pressure
+class ExtGridPressureCheck(DiagnosticFunction):
 
+    def __init__(self):
+        super().__init__()
 
-def pipeflow_alpha_sweep(net, **kwargs):
-    """Run the pipeflow many times with different alpha (NR damping factor) settings between 0.1 and 1 in steps of 0.1"""
-    net.converged = False
-    alphas = [1]
-    for i in range(1, 10):
-        if i % 2 == 1:
-            alphas.append(round(1 - (i // 2) * 0.1, 1))
+        self.standard_pressure_bar = None
+        self.original_ext_grid_pressures = None
+
+    def diagnostic(self, net, **kwargs):
+        if not hasattr(net, "ext_grid") or net.ext_grid.empty:
+            return None
+
+        if "p_bar" not in net.ext_grid.columns:
+            return None
+
+        if net.fluid.is_gas:
+            self.standard_pressure_bar = kwargs["gas_ext_grid_standard_pressure_bar"]
         else:
-            alphas.append(round((i // 2) * 0.1, 1))
-    if kwargs is None:
-        kwargs = {}
+            self.standard_pressure_bar = kwargs["liquid_ext_grid_standard_pressure_bar"]
 
-    for alpha in alphas:
-        kwargs.update({"alpha": alpha})
+        net0 = net.deepcopy()
+
         try:
-            pp.pipeflow(net, **kwargs)
-        except Exception as e:
-            logger.debug(f"Pipeflow did not converge with alpha = {alpha}.\nError: {e}")
-        if net.converged:
-            logger.info(f"Pipeflow did converge with alpha = {alpha}.")
-            return
-    logger.warning(f"Pipeflow did not converge with any alpha in {alphas}.")
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
 
+        except PipeflowNotConverged:
+            pass
+
+        self.original_ext_grid_pressures = net.ext_grid.p_bar.copy()
+
+        net2 = net.deepcopy()
+        net2.ext_grid.loc[:, "p_bar"] = self.standard_pressure_bar
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Ext-grid-pressure check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking ext_grid pressure values...\n")
+
+
+        if result:
+            self.out.warning(
+                f"Ext-grid-pressure problem suspected: pipeflow converges if "
+                f"all ext_grid pressures are set to {self.standard_pressure_bar} bar."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if all ext_grid pressures "
+                f"are set to {self.standard_pressure_bar} bar."
+            )
 
 
 default_diagnostic_functions = [
@@ -1429,4 +1477,5 @@ default_diagnostic_functions = [
     ("alpha_sweep", AlphaSweepCheck(), None),
     ("compressor_pressure_ratio", CompressorPressureRatioCheck(), None),
     ("inactive_pressure_controls", InactivePressureControlsCheck(), []),
+    ("ext_grid_pressure", ExtGridPressureCheck(), None),
 ]
