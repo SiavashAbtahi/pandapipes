@@ -26,28 +26,22 @@ logger = logging.getLogger(__name__)
 
 
 default_argument_values = {
-    "low_length_limit_km": 0.01,
+    "standard_pipe_length_km": 0.01,
     "iteration_limit": 200,
-
     "sink_source_scaling_factor": 1e-5,
-
     "roughness_limit_mm": 0.5,
-    "reduced_k_mm": 1e-5,
-
     "gas_diameter_threshold_mm": 6,
     "liquid_diameter_threshold_mm": 20,
-    "diameter_increase_factor": 2,
-
+    "diameter_increase_factor": 20,
     "heat_transfer_coefficient_limit": 5,
     "heat_transfer_coefficient_scaling_factor": 0.1,
-
     "heat_consumer_scaling_factor": 0.1,
     "deltat_scaling_factor": 2,
-
     "compressor_neutral_pressure_ratio": 1,
+    "ext_grid_pressure_scaling_factor": 1e-5,
+    "circ_pump_mass_flow_scaling_factor": 0.1,
+    "compressor_pressure_ratio_limit": 5,
 
-    "gas_ext_grid_standard_pressure_bar": 5,
-    "liquid_ext_grid_standard_pressure_bar": 5,
 
     "alpha_min": 0.1,
     "alpha_max": 1.0,
@@ -256,67 +250,53 @@ class MissingExtGridCheck(DiagnosticFunction):
             "An external grid is required for gas networks."
         )
 
-
-
-# check zero / low length
-class ShortPipeLengthCheck(DiagnosticFunction):
+# check with standard ext_grid pressure
+class ExtGridPressureCheck(DiagnosticFunction):
 
     def __init__(self):
         super().__init__()
-
-        self.low_length_limit_km = None
-        self.zero_length_pipes = None
-        self.low_length_pipes = None
+        self.ext_grid_pressure_scaling_factor = None
 
     def diagnostic(self, net, **kwargs):
-        self.low_length_limit_km = kwargs["low_length_limit_km"]
-        self.zero_length_pipes = net.pipe.loc[
-            net.pipe.length_km == 0
-        ]
 
-        self.low_length_pipes = net.pipe.loc[
-            net.pipe.length_km <= self.low_length_limit_km
-        ]
-
-        if self.low_length_pipes.empty:
+        if not hasattr(net, "ext_grid") or net.ext_grid.empty:
             return None
 
-        net0 = net.deepcopy()
+        self.ext_grid_pressure_scaling_factor = kwargs["ext_grid_pressure_scaling_factor"]
 
+        net0 = net.deepcopy()
         try:
             pp.pipeflow(net0)
-            if net0.converged:
-                return {"short_pipes_found": True, "convergence_test": None}
 
+            if net0.converged:
+                return None
         except PipeflowNotConverged:
             pass
 
+        if "p_bar" not in net.ext_grid.columns:
+            return None
+
         net2 = net.deepcopy()
-        net2.pipe.loc[
-            net2.pipe.length_km <= self.low_length_limit_km,
-            "length_km"
-        ] = self.low_length_limit_km
+        net2.ext_grid.loc[
+            net2.ext_grid.p_bar.notna(),
+            "p_bar"
+        ] *= self.ext_grid_pressure_scaling_factor
 
         try:
             pp.pipeflow(net2)
-            return {
-                "short_pipes_found": True,
-                "convergence_test": net2.converged
-            }
+            return net2.converged
 
         except PipeflowNotConverged:
-            return {
-                "short_pipes_found": True,
-                "convergence_test": False
-            }
+            return False
 
         except Exception:
             raise
 
     def report(self, error, result):
+
         if error is not None:
             self.out.warning(
-                "Short-pipeline-length check failed due to the following error:"
+                "Ext-grid pressure check failed due to the following error:"
             )
             self.out.warning(error)
             return
@@ -324,34 +304,83 @@ class ShortPipeLengthCheck(DiagnosticFunction):
         if result is None:
             return
 
-        if self.zero_length_pipes is not None and not self.zero_length_pipes.empty:
+        self.out.detailed(
+            "Checking ext_grid pressure...\n"
+        )
+
+        if result:
             self.out.warning(
-                f"{len(self.zero_length_pipes.index)} pipes have a length of 0.0 km. "
-                f"(IDs: {list(self.zero_length_pipes.index)})"
-            )
-
-        if self.low_length_pipes is not None and not self.low_length_pipes.empty:
-            self.out.warning(
-                f"{len(self.low_length_pipes.index)} pipes have a length below or equal to "
-                f"{self.low_length_limit_km} km. This could lead to convergence issues. "
-                f"The lowest length in the net is {self.low_length_pipes.length_km.min()} km. "
-                f"(IDs: {list(self.low_length_pipes.index)})"
-            )
-
-        convergence_test = result.get("convergence_test")
-
-        if convergence_test is None:
-            return
-
-        if convergence_test:
-            self.out.warning(
-                f"Pipe-length problem suspected: pipeflow converges if all short pipelines "
-                f"(< {self.low_length_limit_km} km) are set to {self.low_length_limit_km} km."
+                f"Ext-grid pressure problem suspected: "
+                f"pipeflow converges if ext_grid pressures are scaled "
+                f"by a factor of {self.ext_grid_pressure_scaling_factor}."
             )
         else:
             self.out.warning(
-                f"Pipeflow still does not converge if all short pipelines "
-                f"(< {self.low_length_limit_km} km) are set to {self.low_length_limit_km} km."
+                f"Pipeflow still does not converge if ext_grid pressures "
+                f"are scaled by a factor of "
+                f"{self.ext_grid_pressure_scaling_factor}."
+            )
+
+
+# check with standardized pipe lengths
+class PipeLengthCheck(DiagnosticFunction):
+
+    def __init__(self):
+        super().__init__()
+        self.standard_pipe_length_km = None
+
+    def diagnostic(self, net, **kwargs):
+        self.standard_pipe_length_km = kwargs["standard_pipe_length_km"]
+
+        if not hasattr(net, "pipe") or net.pipe.empty:
+            return None
+
+        net0 = net.deepcopy()
+
+        try:
+            pp.pipeflow(net0)
+            if net0.converged:
+                return None
+
+        except PipeflowNotConverged:
+            pass
+
+        net2 = net.deepcopy()
+        net2.pipe["length_km"] = self.standard_pipe_length_km
+
+        try:
+            pp.pipeflow(net2)
+            return net2.converged
+
+        except PipeflowNotConverged:
+            return False
+
+        except Exception:
+            raise
+
+    def report(self, error, result):
+        if error is not None:
+            self.out.warning(
+                "Pipe-length check failed due to the following error:"
+            )
+            self.out.warning(error)
+            return
+
+        if result is None:
+            return
+
+        logger.detailed("Checking pipe lengths...\n")
+
+        if result:
+            self.out.warning(
+                f"Pipe-length problem suspected: "
+                f"pipeflow converges if all pipe lengths are set to "
+                f"{self.standard_pipe_length_km} km."
+            )
+        else:
+            self.out.warning(
+                f"Pipeflow still does not converge if all pipe lengths are set to "
+                f"{self.standard_pipe_length_km} km."
             )
 
 # check iterations
@@ -414,40 +443,71 @@ class SinkSourceScalingCheck(DiagnosticFunction):
 
     def __init__(self):
         super().__init__()
-
         self.scaling_factor = None
 
     def diagnostic(self, net, **kwargs):
         self.scaling_factor = kwargs["sink_source_scaling_factor"]
-        net0 = net.deepcopy()
-
-        try:
-            pp.pipeflow(net0)
-            if net0.converged:
-                return None
-        except PipeflowNotConverged:
-            pass
 
         if not hasattr(net, "sink") and not hasattr(net, "source"):
             return None
 
-        net2 = net.deepcopy()
+        try:
+            pp.pipeflow(net.deepcopy())
+            return None
+        except PipeflowNotConverged:
+            pass
 
-        if hasattr(net2, "sink"):
-            net2.sink.scaling *= self.scaling_factor
+        result = {
+            "sink": False,
+            "source": False,
+            "both": False
+        }
 
-        if hasattr(net2, "source"):
-            net2.source.scaling *= self.scaling_factor
+        has_sink = hasattr(net, "sink") and not net.sink.empty
+        has_source = hasattr(net, "source") and not net.source.empty
+
+        # 1) only sinks
+        if has_sink and not has_source:
+            net_sink = net.deepcopy()
+            net_sink.sink.scaling *= self.scaling_factor
+
+            try:
+                pp.pipeflow(net_sink)
+                result["sink"] = True
+                return result
+            except PipeflowNotConverged:
+                pass
+
+        # 2) only sources
+        if has_source and not has_sink:
+            net_source = net.deepcopy()
+            net_source.source.scaling *= self.scaling_factor
+
+            try:
+                pp.pipeflow(net_source)
+                result["source"] = True
+                return result
+            except PipeflowNotConverged:
+                pass
+
+        # 3) sinks and sources together
+        net_both = net.deepcopy()
+        changed_anything = False
+
+        if has_sink and has_source:
+            net_both.sink.scaling *= self.scaling_factor
+            net_both.source.scaling *= self.scaling_factor
+            changed_anything = True
 
         try:
-            pp.pipeflow(net2)
-            return net2.converged
-
+            pp.pipeflow(net_both)
+            result["both"] = True
         except PipeflowNotConverged:
-            return False
-
+            pass
         except Exception:
             raise
+
+        return result
 
     def report(self, error, result):
         if error is not None:
@@ -460,32 +520,48 @@ class SinkSourceScalingCheck(DiagnosticFunction):
         if result is None:
             return
 
-        if result:
+        self.out.detailed("Checking sink/source scaling...\n")
+
+        if result["sink"]:
             self.out.warning(
-                f"If sinks and sources were scaled by a factor of "
-                f"{self.scaling_factor}, the pipeflow would converge."
+                f"Sink overload suspected: pipeflow converges if sinks are "
+                f"scaled by a factor of {self.scaling_factor}."
             )
+
+        elif result["source"]:
+            self.out.warning(
+                f"Source overload suspected: pipeflow converges if sources are "
+                f"scaled by a factor of {self.scaling_factor}."
+            )
+
+        elif result["both"]:
+            self.out.warning(
+                f"Sink/source overload suspected: pipeflow converges if sinks "
+                f"and sources are scaled by a factor of {self.scaling_factor}."
+            )
+
         else:
             self.out.warning(
                 f"Pipeflow still does not converge if sinks and sources are "
                 f"scaled by a factor of {self.scaling_factor}."
             )
 
-
-# check k
+# check pipe roughness values
 class PipeRoughnessCheck(DiagnosticFunction):
 
     def __init__(self):
-
         super().__init__()
-        self.reduced_k_mm = None
         self.roughness_limit_mm = None
         self.rough_pipes = None
 
     def diagnostic(self, net, **kwargs):
-
-        self.reduced_k_mm = kwargs["reduced_k_mm"]
         self.roughness_limit_mm = kwargs["roughness_limit_mm"]
+
+        if not hasattr(net, "pipe") or net.pipe.empty:
+            return None
+
+        if "k_mm" not in net.pipe.columns:
+            return None
 
         self.rough_pipes = net.pipe.loc[
             net.pipe.k_mm > self.roughness_limit_mm
@@ -494,43 +570,16 @@ class PipeRoughnessCheck(DiagnosticFunction):
         if self.rough_pipes.empty:
             return None
 
-        result = {
-            "rough_pipes_found": True,
-            "convergence_test": None
+        return {
+            "rough_pipes": list(self.rough_pipes.index),
+            "highest_k_mm": self.rough_pipes.k_mm.max(),
         }
-
-        net0 = net.deepcopy()
-
-        try:
-            pp.pipeflow(net0)
-            if net0.converged:
-                return result
-
-        except PipeflowNotConverged:
-            pass
-
-        net2 = net.deepcopy()
-
-        net2.pipe.loc[
-            net2.pipe.k_mm > self.roughness_limit_mm,
-            "k_mm"
-        ] = self.reduced_k_mm
-
-        try:
-            pp.pipeflow(net2)
-            result["convergence_test"] = net2.converged
-
-        except PipeflowNotConverged:
-            result["convergence_test"] = False
-
-        except Exception:
-            raise
-
-        return result
 
     def report(self, error, result):
         if error is not None:
-            self.out.warning("Pipe-roughness check failed due to the following error:")
+            self.out.warning(
+                "Pipe-roughness check failed due to the following error:"
+            )
             self.out.warning(error)
             return
 
@@ -538,30 +587,11 @@ class PipeRoughnessCheck(DiagnosticFunction):
             return
 
         self.out.warning(
-            f"Some pipes have k_mm > {self.roughness_limit_mm} mm. "
-            f"The highest k_mm in the net is {self.rough_pipes.k_mm.max()} mm.\n"
-            f"Rough pipe IDs: {list(self.rough_pipes.index)}"
+            f"Some pipes have a friction factor k_mm > "
+            f"{self.roughness_limit_mm} mm (extremely rough). "
+            f"The highest value in the net is {result['highest_k_mm']} mm. "
+            f"Up to 0.2 mm is a common value for old steel pipes."
         )
-
-        convergence_test = result["convergence_test"]
-
-        if convergence_test is None:
-            return
-
-        logger.detailed("Checking pipe roughness...\n")
-        if convergence_test:
-            self.out.warning(
-                f"Pipe-roughness problem suspected: pipeflow converges if rough pipes "
-                f"with k_mm > {self.roughness_limit_mm} mm are reduced to "
-                f"{self.reduced_k_mm} mm."
-            )
-        else:
-            self.out.warning(
-                f"Pipeflow still does not converge if rough pipes with "
-                f"k_mm > {self.roughness_limit_mm} mm are reduced to "
-                f"{self.reduced_k_mm} mm."
-            )
-
 
 # check sink and source junctions:
 class MissingNodeJunctionsCheck(DiagnosticFunction):
@@ -708,7 +738,7 @@ class PipeDiameterCheck(DiagnosticFunction):
         if result is None:
             return
 
-        logger.detailed("Checking heat-transfer coefficients...\n")
+        logger.detailed("Checking pipe diameters...\n")
         if result:
             self.out.warning(
                 f"Pipe-diameter problem suspected: "
@@ -1321,50 +1351,43 @@ class InactivePressureControlsCheck(DiagnosticFunction):
                 "are deactivated."
             )
 
-# check with inactive pressure controls
+# check for unrealistic compressor pressure ratios
 class CompressorPressureRatioCheck(DiagnosticFunction):
-    """
-    Checks whether compressor pressure lift is the reason for non-convergence
-    by temporarily setting all compressor pressure ratios to 1.
-    """
 
     def __init__(self):
         super().__init__()
-        self.neutral_pressure_ratio = None
+
+        self.compressor_pressure_ratio_limit = None
+        self.high_pressure_ratio_compressors = None
 
     def diagnostic(self, net, **kwargs):
-        self.neutral_pressure_ratio = kwargs["compressor_neutral_pressure_ratio"]
 
-        if not hasattr(net, "compressor") or net.compressor.empty:
+        self.compressor_pressure_ratio_limit = kwargs[
+            "compressor_pressure_ratio_limit"
+        ]
+
+        if (
+            not hasattr(net, "compressor")
+            or net.compressor.empty
+        ):
             return None
 
-        net0 = net.deepcopy()
+        self.high_pressure_ratio_compressors = net.compressor.loc[
+            net.compressor.pressure_ratio >
+            self.compressor_pressure_ratio_limit
+        ]
 
-        try:
-            pp.pipeflow(net0)
-            if net0.converged:
-                return None
-        except PipeflowNotConverged:
-            pass
+        if self.high_pressure_ratio_compressors.empty:
+            return None
 
-        net2 = net.deepcopy()
-        net2.compressor.pressure_ratio = self.neutral_pressure_ratio
-
-        try:
-            pp.pipeflow(net2)
-            return net2.converged
-
-        except PipeflowNotConverged:
-            return False
-
-        except Exception:
-            raise
+        return True
 
     def report(self, error, result):
 
         if error is not None:
             self.out.warning(
-                "Compressor pressure-ratio check failed due to the following error:"
+                "Compressor-pressure-ratio check failed due to "
+                "the following error:"
             )
             self.out.warning(error)
             return
@@ -1376,36 +1399,29 @@ class CompressorPressureRatioCheck(DiagnosticFunction):
             "Checking compressor pressure ratios...\n"
         )
 
-        if result:
-            self.out.warning(
-                "Compressor pressure-ratio problem suspected: "
-                "pipeflow converges if all compressor pressure ratios are set to 1."
-            )
-        else:
-            self.out.warning(
-                "Pipeflow still does not converge if all compressor pressure ratios are set to 1."
-            )
+        self.out.warning(
+            f"Some compressors have pressure_ratio > "
+            f"{self.compressor_pressure_ratio_limit}. "
 
-# check with standard ext_grid pressure
-class ExtGridPressureCheck(DiagnosticFunction):
+        )
+# check with reduced circulation pump mass flow
+class CircPumpMassFlowCheck(DiagnosticFunction):
 
     def __init__(self):
         super().__init__()
 
-        self.standard_pressure_bar = None
-        self.original_ext_grid_pressures = None
+        self.scaling_factor = None
 
     def diagnostic(self, net, **kwargs):
-        if not hasattr(net, "ext_grid") or net.ext_grid.empty:
-            return None
 
-        if "p_bar" not in net.ext_grid.columns:
-            return None
+        self.scaling_factor = kwargs[
+            "circ_pump_mass_flow_scaling_factor"
+        ]
 
-        if net.fluid.is_gas:
-            self.standard_pressure_bar = kwargs["gas_ext_grid_standard_pressure_bar"]
-        else:
-            self.standard_pressure_bar = kwargs["liquid_ext_grid_standard_pressure_bar"]
+        if (
+            not hasattr(net, "circ_pump_mass") or net.circ_pump_mass.empty
+        ):
+            return None
 
         net0 = net.deepcopy()
 
@@ -1417,10 +1433,8 @@ class ExtGridPressureCheck(DiagnosticFunction):
         except PipeflowNotConverged:
             pass
 
-        self.original_ext_grid_pressures = net.ext_grid.p_bar.copy()
-
         net2 = net.deepcopy()
-        net2.ext_grid.loc[:, "p_bar"] = self.standard_pressure_bar
+        net2.circ_pump_mass["mdot_flow_kg_per_s"] *= self.scaling_factor
 
         try:
             pp.pipeflow(net2)
@@ -1433,9 +1447,11 @@ class ExtGridPressureCheck(DiagnosticFunction):
             raise
 
     def report(self, error, result):
+
         if error is not None:
             self.out.warning(
-                "Ext-grid-pressure check failed due to the following error:"
+                "Circulation-pump-mass-flow check failed due to "
+                "the following error:"
             )
             self.out.warning(error)
             return
@@ -1443,25 +1459,30 @@ class ExtGridPressureCheck(DiagnosticFunction):
         if result is None:
             return
 
-        logger.detailed("Checking ext_grid pressure values...\n")
-
+        logger.detailed(
+            "Checking circulation-pump mass flow...\n"
+        )
 
         if result:
             self.out.warning(
-                f"Ext-grid-pressure problem suspected: pipeflow converges if "
-                f"all ext_grid pressures are set to {self.standard_pressure_bar} bar."
+                f"pipeflow converges if all "
+                f"circ_pump_const_mass_flow elements have their "
+                f"mdot_flow_kg_per_s reduced by factor "
+                f"{self.scaling_factor}."
             )
         else:
             self.out.warning(
-                f"Pipeflow still does not converge if all ext_grid pressures "
-                f"are set to {self.standard_pressure_bar} bar."
+                f"Pipeflow still does not converge if all "
+                f"circ_pump_const_mass_flow elements have their "
+                f"mdot_flow_kg_per_s reduced by factor "
+                f"{self.scaling_factor}."
             )
-
 
 default_diagnostic_functions = [
     ("invalid_values", InvalidValuesCheck(), []),
     ("missing_ext_grid", MissingExtGridCheck(), []),
-    ("short_pipe_length", ShortPipeLengthCheck(), None),
+    ("ext_grid_pressure", ExtGridPressureCheck(), None),
+    ("pipe_length", PipeLengthCheck(), None),
     ("iteration_check", IterationCheck(), None),
     ("sink_source_scaling", SinkSourceScalingCheck(), None),
     ("pipe_roughness", PipeRoughnessCheck(), None),
@@ -1477,5 +1498,5 @@ default_diagnostic_functions = [
     ("alpha_sweep", AlphaSweepCheck(), None),
     ("compressor_pressure_ratio", CompressorPressureRatioCheck(), None),
     ("inactive_pressure_controls", InactivePressureControlsCheck(), []),
-    ("ext_grid_pressure", ExtGridPressureCheck(), None),
+    ("circ_pump_mass_flow", CircPumpMassFlowCheck(), None),
 ]

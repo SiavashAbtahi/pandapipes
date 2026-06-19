@@ -1,22 +1,31 @@
 import copy
-
 import pytest
 import numpy as np
 import pandapipes as pp
 from unittest.mock import patch
-from pandapipes import PipeflowNotConverged
+from pandapipes import PipeflowNotConverged, pandapipesNet
 from pandapipes.diagnostic.diagnostic_functions import(
+    default_argument_values,
     InvalidValuesCheck,
     MissingExtGridCheck,
+    ExtGridPressureCheck,
     IterationCheck,
     SinkSourceScalingCheck,
     MissingNodeJunctionsCheck,
     MissingBranchJunctionsCheck,
     PipeDiameterCheck,
     ValveOpeningCheck,
-    JunctionHeightCheck
+    JunctionHeightCheck,
+    PipeLengthCheck,
+    PipeRoughnessCheck,
+    CircPumpMassFlowCheck,
+    CompressorPressureRatioCheck,
+
 )
 
+@pytest.fixture(scope="function")
+def diag_params():
+    return default_argument_values.copy()
 
 
 def simple_gas_grid():
@@ -46,13 +55,9 @@ def simple_gas_grid():
 
     return net
 
-
 def multi_pump_dh_network():
     net = pp.create_empty_network(fluid="water")
 
-    qext_w = [500000, 200000]
-    tret = np.array([60, 55]) + 273.15
-    tsup = 85 + 273.15
 
     j1 = pp.create_junction(net, 1.05, tfluid_k=358.15, geodata=(0, 1000))
     j2 = pp.create_junction(net, 1.05, tfluid_k=358.15, geodata=(0, 0))
@@ -65,12 +70,12 @@ def multi_pump_dh_network():
 
     pp.create_circ_pump_const_pressure(net, j1, j2, p_flow_bar=4, plift_bar=1.5, t_flow_k=358.15)
 
-    pp.create_pipe_from_parameters(net, j2, j3, length_km=0.5, inner_diameter_mm=0.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
+    pp.create_pipe_from_parameters(net, j2, j3, length_km=0.5, inner_diameter_mm=107.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
     pp.create_pipe_from_parameters(net, j3, j4, length_km=0.5, inner_diameter_mm=107.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
     pp.create_pipe_from_parameters(net, j4, j5, length_km=0.5, inner_diameter_mm=107.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
 
-    pp.create_heat_consumer(net, j5, j6, qext_w=qext_w[0], treturn_k=tret[0])
-    pp.create_heat_consumer(net, j4, j7, qext_w=qext_w[1], treturn_k=tret[1])
+    pp.create_heat_consumer(net, j5, j6, qext_w=500000, treturn_k=333.15)
+    pp.create_heat_consumer(net, j4, j7, qext_w=200000, treturn_k=328.15)
 
     pp.create_pipe_from_parameters(net, j6, j7, length_km=0.5, inner_diameter_mm=107.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
     pp.create_pipe_from_parameters(net, j7, j8, length_km=0.5, inner_diameter_mm=107.1, k_mm=0.1, sections=5, u_w_per_m2k=0, text_k=283)
@@ -88,10 +93,63 @@ def multi_pump_dh_network():
 
     return net
 
+def gas_grid_with_compressor_pressure_control():
+    net = pp.create_empty_network(fluid="lgas")
+
+    j1 = pp.create_junction(net, pn_bar=16.0, tfluid_k=293.15)
+    j2 = pp.create_junction(net, pn_bar=16.0, tfluid_k=293.15)
+    j3 = pp.create_junction(net, pn_bar=14.0, tfluid_k=293.15)
+    j4 = pp.create_junction(net, pn_bar=14.0, tfluid_k=293.15)
+    j5 = pp.create_junction(net, pn_bar=14.0, tfluid_k=293.15)
+    j6 = pp.create_junction(net, pn_bar=14.0, tfluid_k=293.15)
+    j7 = pp.create_junction(net, pn_bar=12.0, tfluid_k=293.15)
+    j8 = pp.create_junction(net, pn_bar=5.0, tfluid_k=293.15)
+    j9 = pp.create_junction(net, pn_bar=5.0, tfluid_k=293.15)
+    j10 = pp.create_junction(net, pn_bar=5.0, tfluid_k=293.15)
+    j11 = pp.create_junction(net, pn_bar=5.0, tfluid_k=293.15)
+
+    pp.create_ext_grid(net, junction=j1, p_bar=16.0, t_k=293.15)
+
+    pp.create_compressor(net, from_junction=j1, to_junction=j2, pressure_ratio=1.10)
+
+    pp.create_pipe_from_parameters(net, j2, j3, length_km=15.0, inner_diameter_mm=400, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j3, j4, length_km=5.0, inner_diameter_mm=250, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j3, j5, length_km=4.0, inner_diameter_mm=200, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j3, j6, length_km=4.5, inner_diameter_mm=200, k_mm=0.1)
+
+    pp.create_valve(net, junction=j5, element=j6, et="ju", inner_diameter_mm=200, opened=True)
+
+    pp.create_pipe_from_parameters(net, j6, j7, length_km=3.0, inner_diameter_mm=200, k_mm=0.1)
+
+    pp.create_pressure_control(
+        net,
+        from_junction=j7,
+        to_junction=j8,
+        controlled_junction=j8,
+        controlled_p_bar=5.0,
+        control_active=True,
+    )
+
+    pp.create_pipe_from_parameters(net, j8, j9, length_km=1.5, inner_diameter_mm=150, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j8, j10, length_km=1.5, inner_diameter_mm=150, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j9, j10, length_km=1.0, inner_diameter_mm=150, k_mm=0.1)
+    pp.create_pipe_from_parameters(net, j11, j9, length_km=1.0, inner_diameter_mm=100, k_mm=0.1)
+
+    pp.create_sink(net, junction=j4, mdot_kg_per_s=1.0)
+    pp.create_sink(net, junction=j5, mdot_kg_per_s=0.45)
+    pp.create_sink(net, junction=j6, mdot_kg_per_s=0.40)
+    pp.create_sink(net, junction=j9, mdot_kg_per_s=0.20)
+    pp.create_sink(net, junction=j10, mdot_kg_per_s=0.20)
+
+    pp.create_source(net, junction=j11, mdot_kg_per_s=0.15)
+
+    return net
+
+
 
 @pytest.fixture(scope="function")
 def test_nets():
-    return [simple_gas_grid(), multi_pump_dh_network()]
+    return [simple_gas_grid(), multi_pump_dh_network(), gas_grid_with_compressor_pressure_control()]
 
 
 def check_report_function(func, error, result):
@@ -348,23 +406,54 @@ def test_missing_ext_grid():
         check_result
     )
 
+def test_ext_grid_pressure_check(diag_params):
+
+
+    net = simple_gas_grid()
+    diag_function = ExtGridPressureCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.ext_grid.p_bar = 100000
+
+    diag_function = ExtGridPressureCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.ext_grid.p_bar = 100000
+    net.junction.loc[3, "height_m"] = 10000
+
+    diag_function = ExtGridPressureCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is False
+    check_report_function(diag_function, None, check_result)
 
 
 
+def test_iteration_check(diag_params):
 
-def test_iteration_check():
 
-    # case 1: network already converges
     net = simple_gas_grid()
 
     diag_function = IterationCheck()
 
-    check_result = diag_function.diagnostic(net,iteration_limit=200)
+    check_result = diag_function.diagnostic(net, **diag_params)
 
     assert check_result is None
     check_report_function(diag_function,None, check_result)
 
-    # case 2: original pipeflow fails, higher iteration limit converges
     net = simple_gas_grid()
 
     def fake_pipeflow_success(net_arg, **kwargs):
@@ -375,52 +464,104 @@ def test_iteration_check():
     with patch(
         "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
         side_effect=fake_pipeflow_success,):
-
-        check_result = diag_function.diagnostic(net, iteration_limit=200)
+        check_result = diag_function.diagnostic(net, **diag_params)
 
     assert check_result is True
 
     check_report_function(diag_function, None, check_result)
 
-    # case 3: original pipeflow fails and still fails with more iterations
+
     net = simple_gas_grid()
 
     with patch(
         "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
         side_effect=PipeflowNotConverged(),
     ):
-        check_result = diag_function.diagnostic(net, iteration_limit=200)
+        check_result = diag_function.diagnostic(net, **diag_params)
+
     assert check_result is False
 
     check_report_function(diag_function, None, check_result)
 
 
-def test_sink_source_scaling():
-    net = simple_gas_grid()
-    check_function = "sink_source_scaling"
+def test_sink_source_scaling(diag_params):
 
+    net = simple_gas_grid()
+    diag_function = SinkSourceScalingCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.source.drop(net.source.index, inplace=True)
+    net.sink.mdot_kg_per_s *= 1e4
+
+    diag_function = SinkSourceScalingCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == {
+        "sink": True,
+        "source": False,
+        "both": False,
+    }
+
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.sink.drop(net.sink.index, inplace=True)
+    net.source.mdot_kg_per_s *= 1e4
+
+    diag_function = SinkSourceScalingCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == {
+        "sink": False,
+        "source": True,
+        "both": False,
+    }
+
+    check_report_function(diag_function, None, check_result)
+
+    net = simple_gas_grid()
     net.sink.mdot_kg_per_s *= 1e4
     net.source.mdot_kg_per_s *= 1e4
 
     diag_function = SinkSourceScalingCheck()
 
-    check_result = diag_function.diagnostic(
-        net,
-        sink_source_scaling_factor=1e-5,
-    )
+    check_result = diag_function.diagnostic(net, **diag_params)
 
-    diag_results = {
-        check_function: check_result
-    } if check_result is not None else {}
+    assert check_result == {
+        "sink": False,
+        "source": False,
+        "both": True,
+    }
 
-    assert diag_results[check_function] == True
+    check_report_function(diag_function, None, check_result)
 
-    check_report_function(
-        diag_function,
-        None,
-        diag_results.get(check_function, None),
-    )
 
+    net = simple_gas_grid()
+    net.sink.mdot_kg_per_s *= 1e4
+    net.source.mdot_kg_per_s *= 1e4
+    net.junction.loc[3, "height_m"] = 10000
+
+    diag_function = SinkSourceScalingCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == {
+        "sink": False,
+        "source": False,
+        "both": False,
+    }
+
+    check_report_function(diag_function, None, check_result)
 
 
 def test_missing_node_junctions():
@@ -510,36 +651,66 @@ def test_missing_branch_junctions():
 
 
 
-
-def test_pipe_diameter():
+def test_pipe_diameter(diag_params):
     net = simple_gas_grid()
-    check_function = "pipe_diameter"
+    diag_function = PipeDiameterCheck()
 
-    net.pipe.loc[0, "inner_diameter_mm"] = 2.5
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.pipe["inner_diameter_mm"] = 0.1
 
     diag_function = PipeDiameterCheck()
 
-    check_result = diag_function.diagnostic(
-        net,
-        gas_diameter_threshold_mm=6,
-        liquid_diameter_threshold_mm=20,
-        diameter_increase_factor=2,
-    )
+    check_result = diag_function.diagnostic(net, **diag_params)
 
-    diag_results = {
-        check_function: check_result
-    } if check_result is not None else {}
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
 
-    assert diag_results[check_function] == True
 
-    check_report_function(diag_function, None, diag_results.get(check_function, None),)
+    net = multi_pump_dh_network()
+    net.pipe["inner_diameter_mm"] = 0.1
 
+    diag_function = PipeDiameterCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.pipe["inner_diameter_mm"] = 0.1
+    net.sink.mdot_kg_per_s *= 1e8
+
+    diag_function = PipeDiameterCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == False
+    check_report_function(diag_function, None, check_result)
+
+
+    net = multi_pump_dh_network()
+    net.pipe["inner_diameter_mm"] = 0.1
+    net.circ_pump_mass.mdot_flow_kg_per_s = 1000
+
+    diag_function = PipeDiameterCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == False
+    check_report_function(diag_function, None, check_result)
 
 
 def test_valve_opening():
     check_function = "valve_opening"
 
-    # case 1: closed valve causes non-convergence, opening all valves helps
+
     net = simple_gas_grid()
     net.valve.opened = False
 
@@ -561,7 +732,7 @@ def test_valve_opening():
 
     check_report_function(diag_function, None, diag_results.get(check_function, None),)
 
-    # case 2: opening valves does NOT solve the problem
+
     net = simple_gas_grid()
 
     net.valve.opened = False
@@ -575,10 +746,9 @@ def test_valve_opening():
 
 
 def test_junction_height():
-    check_function = "junction_height"
     diag_function = JunctionHeightCheck()
 
-    # case 1: flattening junction heights solves the problem
+
     net = simple_gas_grid()
     net.junction.loc[3, "height_m"] = 10000
 
@@ -587,15 +757,130 @@ def test_junction_height():
 
     check_report_function(diag_function, None, check_result,)
 
-    # case 2: flattening junction heights still does not solve the problem
+
     net = simple_gas_grid()
     net.junction.loc[3, "height_m"] = 10000
-    net.sink.mdot_kg_per_s *= 1e8
+    net.sink.mdot_kg_per_s *= 1e4
 
     check_result = diag_function.diagnostic(net)
     assert check_result == False
 
     check_report_function(diag_function, None, check_result,)
+
+
+def test_pipe_length_check(diag_params):
+    net = simple_gas_grid()
+    diag_function = PipeLengthCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.pipe["length_km"] = 1000
+
+    diag_function = PipeLengthCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+
+    net = simple_gas_grid()
+    net.pipe["length_km"] = 1000
+    net.sink.mdot_kg_per_s *= 1e8
+
+    diag_function = PipeLengthCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == False
+    check_report_function(diag_function, None, check_result)
+
+
+def test_pipe_roughness(diag_params):
+
+    net = multi_pump_dh_network()
+
+    diag_function = PipeRoughnessCheck()
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+
+    check_report_function(diag_function, None, check_result)
+
+
+    net = multi_pump_dh_network()
+    net.pipe["k_mm"] = 2.0
+
+    diag_function = PipeRoughnessCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == {
+        "rough_pipes": list(net.pipe.index),
+        "highest_k_mm": 2.0,
+    }
+
+    check_report_function(diag_function, None, check_result)
+
+
+def test_circ_pump_mass_flow(diag_params):
+
+    net = multi_pump_dh_network()
+    diag_function = CircPumpMassFlowCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+    net = multi_pump_dh_network()
+    net.circ_pump_mass.mdot_flow_kg_per_s = 10
+
+    diag_function = CircPumpMassFlowCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+    net = multi_pump_dh_network()
+    net.circ_pump_mass.mdot_flow_kg_per_s = 10
+    net.pipe["inner_diameter_mm"] = 0.1
+
+    diag_function = CircPumpMassFlowCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == False
+    check_report_function(diag_function, None, check_result)
+
+
+def test_compressor_pressure_ratio(diag_params):
+
+    net = gas_grid_with_compressor_pressure_control()
+
+    diag_function = CompressorPressureRatioCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+    net = gas_grid_with_compressor_pressure_control()
+    net.compressor.pressure_ratio = 10
+
+    diag_function = CompressorPressureRatioCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is True
+    check_report_function(diag_function, None, check_result)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-xs"])
