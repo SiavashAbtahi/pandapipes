@@ -20,7 +20,9 @@ from pandapipes.diagnostic.diagnostic_functions import(
     PipeRoughnessCheck,
     CircPumpMassFlowCheck,
     CompressorPressureRatioCheck,
-
+    HeatTransferCoefficientCheck,
+    AlphaSweepCheck,
+    InactivePressureControlsCheck,
 )
 
 @pytest.fixture(scope="function")
@@ -881,6 +883,145 @@ def test_compressor_pressure_ratio(diag_params):
     assert check_result is True
     check_report_function(diag_function, None, check_result)
 
+
+
+def test_heat_transfer_coefficient(diag_params):
+
+    # Original network converges -> check is not required
+    net = multi_pump_dh_network()
+    diag_function = HeatTransferCoefficientCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    # High heat-transfer coefficient causes non-convergence.
+    # Reducing it by factor 0.1 makes the network converge.
+    net = multi_pump_dh_network()
+    net.pipe["u_w_per_m2k"] = 10
+
+    diag_function = HeatTransferCoefficientCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+
+    # Reducing the heat-transfer coefficient is not sufficient,
+    # because the extremely small pipe diameter still prevents convergence.
+    net = multi_pump_dh_network()
+    net.pipe["u_w_per_m2k"] = 10
+    net.pipe["inner_diameter_mm"] = 0.1
+
+    diag_function = HeatTransferCoefficientCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is False
+    check_report_function(diag_function, None, check_result)
+
+
+
+def test_alpha_sweep(diag_params):
+
+    # Original network already converges
+    net = simple_gas_grid()
+    diag_function = AlphaSweepCheck()
+
+    check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    # Original calculation fails, but alpha = 0.5 converges
+    net = simple_gas_grid()
+    diag_function = AlphaSweepCheck()
+
+    def fake_pipeflow_success(net_arg, **kwargs):
+        alpha = kwargs.get("alpha")
+
+        if alpha == 0.5:
+            net_arg.converged = True
+            return
+
+        raise PipeflowNotConverged()
+
+    with patch(
+        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        side_effect=fake_pipeflow_success,
+    ):
+        check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is True
+    assert diag_function.successful_alpha == 0.5
+    assert 0.5 in diag_function.alphas
+
+    check_report_function(diag_function, None, check_result)
+
+
+    # No alpha value causes convergence
+    net = simple_gas_grid()
+    diag_function = AlphaSweepCheck()
+
+    with patch(
+        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        side_effect=PipeflowNotConverged(),
+    ):
+        check_result = diag_function.diagnostic(net, **diag_params)
+
+    assert check_result is False
+    assert diag_function.successful_alpha is None
+    assert diag_function.alphas == [
+        1.0, 0.1, 0.9, 0.2, 0.8,
+        0.3, 0.7, 0.4, 0.6, 0.5,
+    ]
+
+    check_report_function(diag_function, None, check_result)
+
+
+def test_inactive_pressure_controls():
+
+    # Original network converges -> check is not required
+    net = gas_grid_with_compressor_pressure_control()
+    diag_function = InactivePressureControlsCheck()
+
+    check_result = diag_function.diagnostic(net)
+
+    assert check_result is None
+    check_report_function(diag_function, None, check_result)
+
+
+    # Active pressure control with an unrealistic target causes non-convergence.
+    # Deactivating the pressure control makes the network converge.
+    net = gas_grid_with_compressor_pressure_control()
+    net.press_control.controlled_p_bar = 100000
+    net.press_control.control_active = True
+
+    diag_function = InactivePressureControlsCheck()
+
+    check_result = diag_function.diagnostic(net)
+
+    assert check_result == True
+    check_report_function(diag_function, None, check_result)
+
+
+    # Even after deactivating the pressure control,
+    # another severe network problem still prevents convergence.
+    net = gas_grid_with_compressor_pressure_control()
+    net.press_control.controlled_p_bar = 100000
+    net.press_control.control_active = True
+    net.pipe["inner_diameter_mm"] = 0.1
+
+    diag_function = InactivePressureControlsCheck()
+
+    check_result = diag_function.diagnostic(net)
+
+    assert check_result is False
+    check_report_function(diag_function, None, check_result)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-xs"])

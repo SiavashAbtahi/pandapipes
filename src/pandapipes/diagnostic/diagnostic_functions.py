@@ -779,7 +779,7 @@ class HeatTransferCoefficientCheck(DiagnosticFunction):
         net0 = net.deepcopy()
 
         try:
-            pp.pipeflow(net0)
+            pp.pipeflow(net0,  mode="bidirectional")
             if net0.converged:
                 return None
 
@@ -793,7 +793,7 @@ class HeatTransferCoefficientCheck(DiagnosticFunction):
         ] *= self.scaling_factor
 
         try:
-            pp.pipeflow(net2)
+            pp.pipeflow(net2,  mode="bidirectional")
             return net2.converged
 
         except PipeflowNotConverged:
