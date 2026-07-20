@@ -464,7 +464,7 @@ def test_iteration_check(diag_params):
         net_arg.converged = True
 
     with patch(
-        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        "pandapipes.pipeflow",
         side_effect=fake_pipeflow_success,):
         check_result = diag_function.diagnostic(net, **diag_params)
 
@@ -476,7 +476,7 @@ def test_iteration_check(diag_params):
     net = simple_gas_grid()
 
     with patch(
-        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        "pandapipes.pipeflow",
         side_effect=PipeflowNotConverged(),
     ):
         check_result = diag_function.diagnostic(net, **diag_params)
@@ -725,7 +725,7 @@ def test_valve_opening():
         raise PipeflowNotConverged()
 
     with patch(
-        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        "pandapipes.pipeflow",
         side_effect=fake_pipeflow_open_valves_help,
     ):
         check_result = diag_function.diagnostic(net)
@@ -951,7 +951,7 @@ def test_alpha_sweep(diag_params):
         raise PipeflowNotConverged()
 
     with patch(
-        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        "pandapipes.pipeflow",
         side_effect=fake_pipeflow_success,
     ):
         check_result = diag_function.diagnostic(net, **diag_params)
@@ -968,7 +968,7 @@ def test_alpha_sweep(diag_params):
     diag_function = AlphaSweepCheck()
 
     with patch(
-        "pandapipes.diagnostic.diagnostic_functions.pp.pipeflow",
+        "pandapipes.pipeflow",
         side_effect=PipeflowNotConverged(),
     ):
         check_result = diag_function.diagnostic(net, **diag_params)
