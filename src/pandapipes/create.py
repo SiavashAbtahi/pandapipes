@@ -1273,6 +1273,11 @@ def create_junctions(net, nr_junctions, pn_bar, tfluid_k, height_m=0, name=None,
     _set_multiple_entries(net, "junction", index, **entries, **kwargs)
 
     if geodata is not None:
+
+        # Convert a 1D array of (x, y) tuples to a two-column array.
+        if (isinstance(geodata, np.ndarray) and geodata.ndim == 1 and len(geodata) > 0 and isinstance(geodata[0], tuple)):
+            geodata = np.asarray(geodata.tolist(), dtype=float)
+
         # works with a 2-tuple or a matching array
         net.junction_geodata = pd.concat([net.junction_geodata, pd.DataFrame(
             np.zeros((len(index), len(net.junction_geodata.columns)), dtype=int), index=index,
